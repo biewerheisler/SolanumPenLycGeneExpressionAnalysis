@@ -1,0 +1,74 @@
++ read f
++ array=($f)
++ file=SRR12168749
++ name=tuber1
++ echo SRR12168749
++ echo ./data/rawDataLycopersicoides
++ read f
++ array=($f)
++ fasterq-dump SRR12168749 -f -b 500MB -m 500MB -v
++ file=SRR12168750
++ name=tuber2
++ echo SRR12168750
++ echo ./data/rawDataLycopersicoides
++ read f
++ fasterq-dump SRR12168750 -f -b 500MB -m 500MB -v
++ array=($f)
++ file=SRR12168751
++ name=tuber3
++ echo SRR12168751
++ echo ./data/rawDataLycopersicoides
++ read f
++ array=($f)
++ fasterq-dump SRR12168751 -f -b 500MB -m 500MB -v
++ file=SRR12168752
++ name=tuber4
++ echo SRR12168752
++ echo ./data/rawDataLycopersicoides
++ read f
++ array=($f)
++ fasterq-dump SRR12168752 -f -b 500MB -m 500MB -v
++ file=SRR12168753
++ name=tuber5
++ echo SRR12168753
++ echo ./data/rawDataLycopersicoides
++ read f
++ fasterq-dump SRR12168753 -f -b 500MB -m 500MB -v
++ array=($f)
++ file=SRR12168754
++ name=tuber6
++ echo SRR12168754
++ echo ./data/rawDataLycopersicoides
++ read f
++ fasterq-dump SRR12168754 -f -b 500MB -m 500MB -v
++ wait
+Preference setting is: Prefer SRA Preference setting is: Prefer SRA Normalized FormatNormalized Format files with  files with full base quality scoresfull base quality scores if available.
+ if available.
+Preference setting is: Prefer SRA Normalized Format files with full base quality scores if available.
+Preference setting is: Prefer SRA Normalized Format files with full base quality scores if available.
+Preference setting is: Prefer SRA Normalized Format files with full base quality scores if available.
+Preference setting is: Prefer SRA Normalized Format files with full base quality scores if available.
+SRR12168751 is an SRA Normalized Format file with full base quality scores.
+SRR12168754 is an SRA Normalized Format file with full base quality scores.
+SRR12168752 is an SRA Normalized Format file with full base quality scores.
+SRR12168753 is an SRA Normalized Format file with full base quality scores.
+SRR12168749 is an SRA Normalized Format file with full base quality scores.
+SRR12168750 is an SRA Normalized Format file with full base quality scores.
+spots read      : 235,873
+reads read      : 235,873
+reads written   : 235,873
+spots read      : 292,014
+reads read      : 292,014
+reads written   : 292,014
+spots read      : 388,107
+reads read      : 388,107
+reads written   : 388,107
+spots read      : 447,909
+reads read      : 447,909
+reads written   : 447,909
+spots read      : 464,750
+reads read      : 464,750
+reads written   : 464,750
+spots read      : 536,768
+reads read      : 536,768
+reads written   : 536,768

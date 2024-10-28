@@ -1,0 +1,12 @@
+SRR12168749
+./data/rawDataLycopersicoides
+SRR12168750
+./data/rawDataLycopersicoides
+SRR12168751
+./data/rawDataLycopersicoides
+SRR12168752
+./data/rawDataLycopersicoides
+SRR12168753
+./data/rawDataLycopersicoides
+SRR12168754
+./data/rawDataLycopersicoides

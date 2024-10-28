@@ -1,0 +1,38 @@
+    1  ls
+    2  pwd
+    3  mkdir geneExpression
+    4  cd geneExpression
+    5  mkdir data
+    6  mkdir data/rawData
+    7  ls
+    8  module avail
+    9  module load sra-toolkit
+   10  help
+   11  fasterq-dump
+   12  srun -p general --time=6:00:00 --mem=64G --cpus-per-task=1 --pty bash
+   13* srun -p general --time=4:00:00 --mem=20G --cpus-per-task=1 --pty bashOB
+   14  clear
+   15  ls
+   16  cd preprocessing/
+   17  ls
+   18  vim countFeatures
+   19  vim ../data/genome/ITAG4.0_gene_models.gff 
+   20  vim countFeatures 
+   21  ls -a
+   22  rm .countFeatures.swp 
+   23  vim countFeatures 
+   24  bash countFeatures 
+   25  vim countFeatures 
+   26  bash countFeatures 
+   27  ls
+   28  vim countFeatures 
+   29  bash countFeatures 
+   30  ls
+   31  vim sample_1_readCounts.summary 
+   32  vim sample_1_readCounts
+   33  vim countFeatures 
+   34  bash countFeatures 
+   35  ls
+   36  vim sample_1_readCounts.summary 
+   37  vim sample_1_readCounts
+   38  history > session7.19.21_2History

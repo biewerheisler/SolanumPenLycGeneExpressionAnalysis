@@ -5,6 +5,8 @@ The main code is all in PMERNAseqDeseq.Rmd. Old versions of the code,
 with obsolete sections, exist across timRNAseq_deseq2.Rmd, timRNAseq_deseq2.Rmd, 
 and tissue_specific.Rmd.
 
+Scripts used by Matthew Gibson for preprocessing are in scripts
+
 Data files include:
 
 OriginalData
