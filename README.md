@@ -11,10 +11,12 @@ OriginalData
 	-InplantaPollenTubeGrowth.csv = In-vivo (in planta) pollen tube growth data
 	-LycoPennPollenTubeGrowthAsssay.csv = In-vitro pollen tube growth data
 	-UnFrozenLycoPennInVitro.csv = In-vitro pollen tube growth using never-frozen pollen
+ 
 OriginalImages
 	-InVitroImages = Images of in-vitro pollen tube growth
 	-InVivoImages = Images of in-vivo pollen tube growth, original images and images stitched together
 	-UnfrozenPollenInVitroTests = Images of in-vitro pollen tube growth using never-frozen pollen
+ 
 ProcessedData
 	-designMatrixNoGermStyle.csv = design matrix for deseq2 used in publication
 	-hyp_tests_GoodPollenStyle.csv = results of deseq2 tests, used in publication
