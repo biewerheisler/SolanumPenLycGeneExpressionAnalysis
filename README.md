@@ -5,6 +5,7 @@ with obsolete sections, exist across timRNAseq_deseq2.Rmd, timRNAseq_deseq2.Rmd,
 and tissue_specific.Rmd.
 
 Data files include:
+
 OriginalData
 	-pen_lyc_readcounts.txt = The read counts for all tissues and replicates
 	-LycoPMEPMEI.csv = The PME and PMEI gene IDs in the S. lycopersicum genome.
