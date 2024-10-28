@@ -9,7 +9,7 @@ Scripts used by Matthew Gibson for preprocessing are in scripts
 
 Data files include:
 
-Supplement_BHetalTBD.xlsx = Supplemental tables referenced in the main text_
+Supplement_BHetalTBD.xlsx = Supplemental tables referenced in the main text.
 
 OriginalData
 	-pen_lyc_readcounts.txt = The read counts for all tissues and replicates
