@@ -1,0 +1,4287 @@
+---
+title: "PMEAnalysis_PollenStyleDeseq2"
+author: "Timothy Biewer-Heisler & Matt Gibson"
+date: "2024-07-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+setwd("/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data")
+
+library(ggplot2)
+library(DESeq2)
+library(tidyverse)
+library(DT)
+library(stringr)
+library(dplyr)
+if (!require(writexl)) {
+  install.packages("writexl")
+}
+
+library(writexl)
+library(agricolae)
+
+if (!require(ggpubr)) {
+  install.packages("ggpubr")
+
+}
+
+if (!require(ggsignif)) {
+  install.packages("ggsignif")
+
+}
+library(ggpubr)
+
+library(ggsignif)
+
+if (!require(dplyr)) {
+  install.packages("dplyr")
+}
+if (!require(broom)) {
+  install.packages("broom")
+}
+library(dplyr)
+library(broom)
+
+
+if (!require(matrixStats)) {
+  install.packages("matrixStats")
+}
+library(matrixStats)
+
+```
+
+### Utility functions
+```{r}
+#Plotting function
+plot_genes_base <- function(dds, genelist, ncol, nrow){
+  par(mfrow=c(ncol,nrow), mar = c(3,5,3,3))
+  
+  for(i in seq(1,length(genelist))){
+    plotCounts(dds, gene=as.character(genelist[i]), intgroup=c("tissue1", "species"), xlab = "",cex.lab=2, cex.axis = 1.3, pch=21,cex = 2.5, bg = "seagreen",col = "gray") 
+  }
+  par(mfrow=c(1,1))
+}
+
+counts_to_tpm <- function(counts, geneLength) {
+  
+  # Ensure valid arguments.
+  stopifnot(length(geneLength) == nrow(counts))
+  
+  # Process one column at a time.
+  tpm <- do.call(cbind, lapply(1:ncol(counts), function(i) {
+    rate = log(counts[,i]) - log(geneLength[i])
+    denom = log(sum(exp(rate)))
+    exp(rate - denom + log(1e6))
+  }))
+  
+  # Copy the row and column names from the original matrix.
+  colnames(tpm) <- colnames(counts)
+  rownames(tpm) <- rownames(counts)  
+  tpm <- data.frame(tpm)
+  return(tpm)
+}
+
+classify_expressed <- function(row, names, cutoff){
+  #Checks if gene is expressed greater than [cutoff] in at least 1 of the tissues included in  names.
+  #Returns boolean
+  
+  row <- row[which(names(row) %in% names)]
+  for(i in seq(1, length(names))){
+    if (as.numeric(row[i]) > cutoff){
+      return(TRUE)
+    }
+  }
+  return(FALSE)
+}
+
+classify_trace <- function(row, names, cutoff){
+  #Checks if gene is expressed less than [cutoff] in ALL of the tissues included in names.
+  #Returns boolean
+  
+  num_trace <-  0
+  
+  row <- row[which(names(row) %in% names)]
+  for(i in seq(1, length(names))){
+    if (as.numeric(row[i]) < cutoff){
+      num_trace <- num_trace + 1
+    }
+  }
+  if  (num_trace == length(names)){
+    return(TRUE)
+  }else{return(FALSE)}
+  
+}
+
+```
+
+# Data
+```{r}
+readCounts <- data.frame(as_tibble(read.csv("/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/pen_lyc_readcounts.txt", sep = "\t")) %>% dplyr::select(-Strand) %>% 
+  mutate_at("Geneid", str_replace, "gene:", "")  %>% filter(Chr != "SL4.0ch00"))
+readCounts <- readCounts  %>% dplyr::select(-Chr,-Start,-End,-Length, -Slyc_stygerm1,-Slyc_stygerm2,-Slyc_stygerm3, -Spen_stygerm1, -Spen_stygerm2, -Spen_stygerm3)
+
+#meta <- read.csv("/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/designMatrix.csv")
+#meta <- read.csv("/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/designMatrixTest.csv")
+meta <- read.csv("/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/designMatrixNoGermStyle.csv")
+meta$status <- as.factor(meta$status)
+meta$status_nested <- as.factor(meta$status_nested)
+
+metaUnited <- meta %>%
+  unite("species_tissue1", c(species, tissue1), remove = F)
+
+metaUnited$species_tissue1 <- as.factor(metaUnited$species_tissue1)
+
+genes <- read.csv('/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/LycoPMEPMEI.csv')
+
+pmes <- genes %>% filter(str_detect(Gene.ID, "PME") & !str_detect(Gene.ID, "PMEI"))
+pmeis <- genes %>% filter(str_detect(Gene.ID, "PMEI"))
+pmeis_short <- substr(pmeis$Locus.ID,1,14)
+pmes_short <- substr(pmes$Locus.ID,1,14)
+
+
+#these are the pme/pmei lists that I generated myself by searching the newest annotation
+newPMEs <- substr(read_lines(file = '/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/newPMEList.txt'),1,14)
+newPMEIs <- substr(read_lines(file = '/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/newPMEIList.txt'),1,14)
+```
+
+### Quick aside: how do the new and old pme lists compare?
+```{r}
+length(pmes$Locus.ID)
+length(newPMEs)
+#New pme list is slightly smaller
+
+length(pmeis$Locus.ID)
+length(newPMEIs)
+#New pmei list is smaller
+```
+I explored this a little bit. Lists are slightly different because 1) chr0 is not included in my search and 2) gene suffixes have changed in updated assemblies (expected)
+
+
+# Model fitting
+For each gene, we are fitting a linear model to examine:
+Pollen Expression Between Species
+Style Expression Between Species
+
+```{r}
+#filtering to just those with any expression
+#Need to update supplemental and text. 29999 are expressed in any tissue. 21039 are expressed at >2 TPM in any tissue
+emptyRows <- readCounts[apply(readCounts[, -1], 1, function(x) all(x <= 0)), ]
+
+readCountsFilt <- readCounts %>%
+  filter(!(Geneid %in% emptyRows$Geneid))
+
+ddsMetaUnited <- DESeqDataSetFromMatrix(countData = readCountsFilt, tidy = T, colData = metaUnited, design = ~0 + species_tissue1)
+
+ddsMetaUnitedOut <- DESeq(ddsMetaUnited)
+resultsNames(ddsMetaUnitedOut)
+```
+
+This next one compares first pollen and then style tissues between species
+```{r}
+resPollen_species <- results(ddsMetaUnitedOut, contrast = c("species_tissue1", "lyc_pollen", "pen_pollen"))
+
+resPollen_species <- as.data.frame(resPollen_species)
+resPollen_species$Geneid <- rownames(resPollen_species)
+
+resStyle_species <- results(ddsMetaUnitedOut, contrast = c("species_tissue1", "lyc_style", "pen_style"))
+
+resStyle_species <- as.data.frame(resStyle_species)
+resStyle_species$Geneid <- rownames(resStyle_species)
+```
+
+
+## Summary data frame
+```{r}
+#Summarized all above results
+results_dfUnited <- data.frame(GeneID = resPollen_species$Geneid,
+                         LFC_pollen.species = resPollen_species$log2FoldChange, P_pollen.species = resPollen_species$padj,
+                         LFC_style.species = resStyle_species$log2FoldChange, P_style.species = resStyle_species$padj)
+
+write.table(results_dfUnited, "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/hyp_tests_GoodPollenStyle.csv",quote = F,sep = ",")
+
+results_dfPollenStyle <- read.csv("hyp_tests_GoodPollenStyle.csv") #new version with only the contrasts we used 
+results_dfOrig <- read.csv("hyp_tests_tim_rnaseq.csv")
+view(results_dfPollenStyle)
+datatable(results_dfPollenStyle)
+
+view(results_dfUnited)
+```
+
+## Data and preprocessing
+
+### Load data
+```{r}
+dfNew <- read.csv("/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/pen_lyc_readcounts.txt", sep = "\t")
+```
+
+### Convert to TPM
+```{r}
+df_tpm <- counts_to_tpm(dfNew[,c(7:ncol(dfNew))], dfNew$Length)
+df_tpm$GeneID <- str_remove(dfNew$Geneid, "gene:")
+```
+
+### Calculate averages
+```{r}
+slyc_polgerm <- rowMeans(df_tpm[,c(1,2,3)])
+slyc_polgermStErr <- rowSds(as.matrix(df_tpm[,c(1,2,3)]))
+slyc_polungerm <- rowMeans(df_tpm[,c(4,5,6)])
+slyc_polungermStErr <- rowSds(as.matrix(df_tpm[,c(4,5,6)]))
+slyc_pollenStErr <- rowSds(as.matrix(df_tpm[,c(1:6)]))
+slyc_styungerm <- rowMeans(df_tpm[,c(10,11,12)])
+slyc_styungermStErr <- rowSds(as.matrix(df_tpm[,c(10,11,12)]))
+slyc_leafP3P4 <- rowMeans(df_tpm[,c(25:33)])
+slyc_leafP3P4StErr <- rowSds(as.matrix(df_tpm[,c(25:33)]))
+slyc_leafP5P6 <- rowMeans(df_tpm[,c(34:45)])
+slyc_leafP5P6StErr <- rowSds(as.matrix(df_tpm[,c(34:45)]))
+slyc_leafStErr <- rowSds(as.matrix(df_tpm[,c(25:45)]))
+
+
+
+spen_polgerm <- rowMeans(df_tpm[,c(13,14,15)])
+spen_polgermStErr <- rowSds(as.matrix(df_tpm[,c(13,14,15)]))
+spen_polungerm <- rowMeans(df_tpm[,c(16,17,24)])
+spen_polungermStErr <- rowSds(as.matrix(df_tpm[,c(16,17,24)]))
+spen_pollenStErr <- rowSds(as.matrix(df_tpm[,c(13,14,15,16,17,24)]))
+spen_styungerm <- rowMeans(df_tpm[,c(21,22,23)])
+spen_styungermStErr <- rowSds(as.matrix(df_tpm[,c(21,22,23)]))
+spen_leafP3P4 <- rowMeans(df_tpm[,c(46:54)])
+spen_leafP3P4StErr <- rowSds(as.matrix(df_tpm[,c(46:54)]))
+spen_leafP5P6 <- rowMeans(df_tpm[,c(55:66)])
+spen_leafP5P6StErr <- rowSds(as.matrix(df_tpm[,c(55:66)]))
+spen_leafStErr <- rowSds(as.matrix(df_tpm[,c(46:66)]))
+
+
+df_tpm <- data.frame(GeneID = df_tpm$GeneID,
+                     slyc_polgerm = slyc_polgerm,
+                     slyc_polungerm = slyc_polungerm,
+                     slyc_styungerm = slyc_styungerm,
+                     slyc_leafP3P4 = slyc_leafP3P4,
+                     slyc_leafP5P6 = slyc_leafP5P6,
+                     spen_polgerm = spen_polgerm,
+                     spen_polungerm = spen_polungerm,
+                     spen_styungerm = spen_styungerm,
+                     spen_leafP3P4 = spen_leafP3P4,
+                     spen_leafP5P6 = spen_leafP5P6)
+df_tpmWStErr <- data.frame(GeneID=df_tpm$GeneID,
+                           slyc_polgerm=slyc_polgerm,
+                           slyc_polgermStErr=slyc_polgermStErr,
+                           slyc_polungerm=slyc_polungerm,
+                           slyc_polungermStErr=slyc_polungermStErr,
+                           slyc_styungerm=slyc_styungerm,
+                           slyc_styungermStErr=slyc_styungermStErr,
+                           slyc_leafP3P4=slyc_leafP3P4,
+                           slyc_leafP3P4StErr=slyc_leafP3P4StErr,
+                           slyc_leafP5P6=slyc_leafP5P6,
+                           slyc_leafP5P6StErr=slyc_leafP5P6StErr,
+                           slyc_pollenStErr=slyc_pollenStErr,
+                           slyc_leafStErr=slyc_leafStErr,
+                           spen_polgerm=spen_polgerm,
+                           spen_polgermStErr=spen_polgermStErr,
+                           spen_polungerm=spen_polungerm,
+                           spen_polungermStErr=spen_polungermStErr,
+                           spen_styungerm=spen_styungerm,
+                           spen_styungermStErr=spen_styungermStErr,
+                           spen_leafP3P4=spen_leafP3P4,
+                           spen_leafP3P4StErr=spen_leafP3P4StErr,
+                           spen_leafP5P6=spen_leafP5P6,
+                           spen_leafP5P6StErr=spen_leafP5P6StErr,
+                           spen_pollenStErr=spen_pollenStErr,
+                           spen_leafStErr=spen_leafStErr) 
+df_tpm <- df_tpm %>% filter(!str_detect(GeneID, "Solyc00"))
+write.csv(df_tpm, "~/Desktop/PMEDifferentialGeneExpExp/data/LycPenTPM.csv")
+df_tpmWStErr <- df_tpmWStErr %>% filter(!str_detect(GeneID,"Solyc00"))
+write.csv(df_tpmWStErr,"~/Desktop/PMEDifferentialGeneExpExp/data/LycPenTPMWithStErr.csv")
+```
+#### Converting to log2 expression for simpler visualization
+```{r}
+#replace everything <1 TPM with NA
+df_tpm_NA <- replace(df_tpm, df_tpm < 1, NA)
+view(df_tpm_NA)
+#log transform (just the data without transcript IDs)
+df_tpm_NA_log <- log2(df_tpm_NA[,c(2:68)])
+
+#replace NAs with 0
+df_tpm_log <- replace(df_tpm_NA_log, is.na(df_tpm_NA_log), 0)
+df_tpm_log$GeneID <-df_tpm$GeneID
+
+slyc_polgerm <- rowMeans(df_tpm_log[,c(1,2,3)])
+slyc_polgermStErr <- rowSds(as.matrix(df_tpm_log[,c(1,2,3)]))
+slyc_polungerm <- rowMeans(df_tpm_log[,c(4,5,6)])
+slyc_polungermStErr <- rowSds(as.matrix(df_tpm_log[,c(4,5,6)]))
+
+slyc_styungerm <- rowMeans(df_tpm_log[,c(10,11,12)])
+slyc_styungermStErr <- rowSds(as.matrix(df_tpm_log[,c(10,11,12)]))
+slyc_leafP3P4 <- rowMeans(df_tpm_log[,c(25:33)])
+slyc_leafP3P4StErr <- rowSds(as.matrix(df_tpm_log[,c(25:33)]))
+slyc_leafP5P6 <- rowMeans(df_tpm_log[,c(34:45)])
+slyc_leafP5P6StErr <- rowSds(as.matrix(df_tpm_log[,c(34:45)]))
+slyc_pollen <- rowMeans(df_tpm_log[,c(1:6)])
+slyc_pollenStErr <- rowSds(as.matrix(df_tpm_log[,c(1:6)]))
+slyc_leaf <- rowMeans(df_tpm_log[,c(25:45)])
+slyc_leafStErr <- rowSds(as.matrix(df_tpm_log[,c(25:45)]))
+
+spen_polgerm <- rowMeans(df_tpm_log[,c(13,14,15)])
+spen_polgermStErr <- rowSds(as.matrix(df_tpm_log[,c(13,14,15)]))
+spen_polungerm <- rowMeans(df_tpm_log[,c(16,17,24)])
+spen_polungermStErr <- rowSds(as.matrix(df_tpm_log[,c(16,17,24)]))
+
+spen_styungerm <- rowMeans(df_tpm_log[,c(21,22,23)])
+spen_styungermStErr <- rowSds(as.matrix(df_tpm_log[,c(21,22,23)]))
+spen_leafP3P4 <- rowMeans(df_tpm_log[,c(46:54)])
+spen_leafP3P4StErr <- rowSds(as.matrix(df_tpm_log[,c(46:54)]))
+spen_leafP5P6 <- rowMeans(df_tpm_log[,c(55:66)])
+spen_leafP5P6StErr <- rowSds(as.matrix(df_tpm_log[,c(55:66)]))
+spen_pollen <- rowMeans(df_tpm_log[,c(13,14,15,16,17,24)])
+spen_pollenStErr <- rowSds(as.matrix(df_tpm_log[,c(13,14,15,16,17,24)]))
+spen_leaf <- rowMeans(df_tpm_log[,c(46:66)])
+spen_leafStErr <- rowSds(as.matrix(df_tpm_log[,c(46:66)]))
+
+df_tpm_logWStErr <- data.frame(GeneID=df_tpm$GeneID,
+                           slyc_polgerm=slyc_polgerm,
+                           slyc_polgermStErr=slyc_polgermStErr,
+                           slyc_polungerm=slyc_polungerm,
+                           slyc_polungermStErr=slyc_polungermStErr,
+                           slyc_styungerm=slyc_styungerm,
+                           slyc_styungermStErr=slyc_styungermStErr,
+                           slyc_leafP3P4=slyc_leafP3P4,
+                           slyc_leafP3P4StErr=slyc_leafP3P4StErr,
+                           slyc_leafP5P6=slyc_leafP5P6,
+                           slyc_leafP5P6StErr=slyc_leafP5P6StErr,
+                           slyc_pollen=slyc_pollen,
+                           slyc_pollenStErr=slyc_pollenStErr,
+                           slyc_leaf=slyc_leaf,
+                           slyc_leafStErr=slyc_leafStErr,
+                           spen_polgerm=spen_polgerm,
+                           spen_polgermStErr=spen_polgermStErr,
+                           spen_polungerm=spen_polungerm,
+                           spen_polungermStErr=spen_polungermStErr,
+                           spen_styungerm=spen_styungerm,
+                           spen_styungermStErr=spen_styungermStErr,
+                           spen_leafP3P4=spen_leafP3P4,
+                           spen_leafP3P4StErr=spen_leafP3P4StErr,
+                           spen_leafP5P6=spen_leafP5P6,
+                           spen_leafP5P6StErr=spen_leafP5P6StErr,
+                           spen_pollen=spen_pollen,
+                           spen_pollenStErr=spen_pollenStErr,
+                           spen_leaf=spen_leaf,
+                           spen_leafStErr=spen_leafStErr) 
+
+df_tpm_logWStErr <- df_tpm_logWStErr %>% filter(!str_detect(GeneID,"Solyc00"))
+write.csv(df_tpm_logWStErr,"~/Desktop/PMEDifferentialGeneExpExp/data/LycPenTPMLog2WithStErr.csv")
+df_tpm_logWStErrLoaded <- read.csv("~/Desktop/PMEDifferentialGeneExpExp/data/LycPenTPMLog2WithStErr.csv")
+view(df_tpm_logWStErr)
+df_tpm_logWStErr <- df_tpm_logWStErrLoaded %>%
+  dplyr::select(-X)
+```
+## Tissue specificity
+```{r}
+upperCutoff <- 2
+lowerCutoff <- 1
+```
+
+### LYC
+#### LYC Pollen
+```{r}
+lyc_pol <- df_tpm %>% mutate(LycPolExpressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_polungerm", "slyc_polgerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c( "slyc_styungerm", "slyc_leafP3P4", "slyc_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("LycPolExpressed", "Trace"))
+lyc_pol <- lyc_pol$LycPolExpressed & lyc_pol$Trace
+table(lyc_pol)
+datatable(df_tpm[lyc_pol,])
+```
+#### LYC Pollen Ungerm
+```{r}
+lyc_pol_ungerm <- df_tpm %>% mutate(LycPolExpressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_polungerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("slyc_polgerm", "slyc_styungerm", "slyc_leafP3P4", "slyc_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("LycPolExpressed", "Trace"))
+
+lyc_pol_ungerm <- lyc_pol_ungerm$LycPolExpressed & lyc_pol_ungerm$Trace
+table(lyc_pol_ungerm)
+datatable(df_tpm[lyc_pol_ungerm,])
+```
+
+#### LYC Pollen Germ
+```{r}
+lyc_pol_germ <- df_tpm %>% mutate(LycPolExpressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_polgerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("slyc_polungerm", "slyc_styungerm", "slyc_leafP3P4", "slyc_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("LycPolExpressed", "Trace"))
+
+lyc_pol_germ <- lyc_pol_germ$LycPolExpressed & lyc_pol_germ$Trace
+table(lyc_pol_germ)
+datatable(df_tpm[lyc_pol_germ,])
+```
+
+#### LYC Style
+```{r}
+lyc_sty <- df_tpm %>% mutate(LycStyExpressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_styungerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("slyc_polungerm", "slyc_polgerm", "slyc_leafP3P4", "slyc_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("LycStyExpressed", "Trace"))
+
+lyc_sty <- lyc_sty$LycStyExpressed & lyc_sty$Trace
+table(lyc_sty)
+datatable(df_tpm[lyc_sty,])
+```
+
+#### LYC Leaf P3P4
+```{r}
+lyc_p3p4 <- df_tpm %>% mutate(Lycp3p4Expressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_leafP3P4"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("slyc_polungerm", "slyc_polgerm", "slyc_styungerm", "slyc_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("Lycp3p4Expressed", "Trace"))
+
+lyc_p3p4 <- lyc_p3p4$Lycp3p4Expressed & lyc_p3p4$Trace
+table(lyc_p3p4)
+datatable(df_tpm[lyc_p3p4,])
+```
+
+#### LYC Leaf P5P6
+```{r}
+lyc_p5p6 <- df_tpm %>% mutate(lycp5p6Expressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_leafP5P6"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("slyc_polungerm", "slyc_polgerm", "slyc_styungerm", "slyc_leafP3P4"), lowerCutoff)) %>% dplyr::select(c("lycp5p6Expressed", "Trace"))
+
+lyc_p5p6 <- lyc_p5p6$lycp5p6Expressed & lyc_p5p6$Trace
+table(lyc_p5p6)
+datatable(df_tpm[lyc_p5p6,])
+```
+#### LYC Leaf
+```{r}
+lyc_leaf <- df_tpm %>% mutate(LycLeafExpressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_leafP3P4","slyc_leafP5P6"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("slyc_polungerm", "slyc_polgerm", "slyc_styungerm"), lowerCutoff)) %>% dplyr::select(c("LycLeafExpressed", "Trace"))
+
+lyc_leaf <- lyc_leaf$LycLeafExpressed & lyc_leaf$Trace
+table(lyc_leaf)
+datatable(df_tpm[lyc_leaf,])
+
+```
+
+### PEN
+#### PEN Pollen
+```{r}
+pen_pol <- df_tpm %>% mutate(PenPolExpressed = apply(df_tpm, 1, classify_expressed, names = c("spen_polungerm", "spen_polgerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c( "spen_styungerm", "spen_leafP3P4", "spen_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("PenPolExpressed", "Trace"))
+pen_pol <- pen_pol$PenPolExpressed & pen_pol$Trace
+table(pen_pol)
+datatable(df_tpm[pen_pol,])
+```
+#### PEN Pollen Ungerm
+```{r}
+pen_pol_ungerm <- df_tpm %>% mutate(PenPolExpressed = apply(df_tpm, 1, classify_expressed, names = c("spen_polungerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("spen_polgerm", "spen_styungerm", "spen_leafP3P4", "spen_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("PenPolExpressed", "Trace"))
+
+pen_pol_ungerm <- pen_pol_ungerm$PenPolExpressed & pen_pol_ungerm$Trace
+table(pen_pol_ungerm)
+datatable(df_tpm[pen_pol_ungerm,])
+```
+
+#### PEN Pollen Germ
+```{r}
+pen_pol_germ <- df_tpm %>% mutate(PenPolExpressed = apply(df_tpm, 1, classify_expressed, names = c("spen_polgerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("spen_polungerm", "spen_styungerm", "spen_leafP3P4", "spen_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("PenPolExpressed", "Trace"))
+
+pen_pol_germ <- pen_pol_germ$PenPolExpressed & pen_pol_germ$Trace
+table(pen_pol_germ)
+datatable(df_tpm[pen_pol_germ,])
+```
+
+#### PEN Style
+```{r}
+pen_sty <- df_tpm %>% mutate(PenStyExpressed = apply(df_tpm, 1, classify_expressed, names = c("spen_styungerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("spen_polungerm", "spen_polgerm", "spen_leafP3P4", "spen_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("PenStyExpressed", "Trace"))
+
+pen_sty <- pen_sty$PenStyExpressed & pen_sty$Trace
+table(pen_sty)
+datatable(df_tpm[pen_sty,])
+```
+
+#### PEN Leaf P3P4
+```{r}
+pen_p3p4 <- df_tpm %>% mutate(Penp3p4Expressed = apply(df_tpm, 1, classify_expressed, names = c("spen_leafP3P4"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("spen_polungerm", "spen_polgerm", "spen_styungerm", "spen_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("Penp3p4Expressed", "Trace"))
+
+pen_p3p4 <- pen_p3p4$Penp3p4Expressed & pen_p3p4$Trace
+table(pen_p3p4)
+datatable(df_tpm[pen_p3p4,])
+```
+
+#### PEN Leaf P5P6
+```{r}
+pen_p5p6 <- df_tpm %>% mutate(penp5p6Expressed = apply(df_tpm, 1, classify_expressed, names = c("spen_leafP5P6"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("spen_polungerm", "spen_polgerm", "spen_styungerm", "spen_leafP3P4"), lowerCutoff)) %>% dplyr::select(c("penp5p6Expressed", "Trace"))
+
+pen_p5p6 <- pen_p5p6$penp5p6Expressed & pen_p5p6$Trace
+table(pen_p5p6)
+datatable(df_tpm[pen_p5p6,])
+
+```
+
+#### PEN Leaf
+```{r}
+pen_leaf <- df_tpm %>% mutate(PenLeafExpressed = apply(df_tpm, 1, classify_expressed, names = c("spen_leafP3P4","spen_leafP5P6"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("spen_polungerm", "spen_polgerm", "spen_styungerm"), lowerCutoff)) %>% dplyr::select(c("PenLeafExpressed", "Trace"))
+
+pen_leaf <- pen_leaf$PenLeafExpressed & pen_leaf$Trace
+table(pen_leaf)
+datatable(df_tpm[pen_leaf,])
+
+```
+
+### Aggregate datasets
+```{r}
+specificDataset <- data.frame("GeneID"=df_tpm[,1])
+specificDataset <- specificDataset %>%
+  add_column(lyc_pol_germ,lyc_pol_ungerm,lyc_pol,lyc_sty,lyc_p3p4,lyc_p5p6,lyc_leaf, pen_pol_germ,pen_pol_ungerm,pen_pol,pen_sty,pen_p3p4,pen_p5p6,pen_leaf ) 
+
+write.csv(specificDataset,"~/Desktop/PMEDifferentialGeneExpExp/data/specificDataset.csv")
+specificDatasetLoaded <- read.csv("~/Desktop/PMEDifferentialGeneExpExp/data/specificDataset.csv")
+view(specificDataset)
+specificDataset <- specificDatasetLoaded %>%
+  dplyr::select(-X)
+
+```
+
+#A tissue is considered specific when it has less than 5 TPM in every but one tissue.
+#Data and preprocessing
+```{r} 
+#most of the work done through tissue_specific.Rmd
+PenLycTPM <-read.csv("~/Desktop/PMEDifferentialGeneExpExp/data/LycPenTPM.csv", sep = ",")
+#Removed weird excess column 
+#PenLycTPM <- PenLycTPM[,2:12] 
+PenLycTPMStErr <- read.csv("~/Desktop/PMEDifferentialGeneExpExp/data/LycPenTPMWithStErr.csv", sep = ",")
+#removed weird excess column
+#PenLycTPMStErr<-PenLycTPMStErr[,2:26]
+PenLycTPMLog2StErr <- read.csv("~/Desktop/PMEDifferentialGeneExpExp/data/LycPenTPMLog2WithStErr.csv", sep = ",")
+#removed weird excess column
+#PenLycTPMLog2StErr<-PenLycTPMLog2StErr[,2:30]
+```
+
+#Section here for calculating Tau
+```{r}
+#first separating PenLycTPM between species 
+PenTPM <- PenLycTPM[,c(1,7:11)]
+LycTPM <- PenLycTPM[,c(1:6)]
+#quick check of the normalization to see if it comes to about 0, it looks like it does.
+differenceTest <- PenLycTPM$slyc_polgerm - PenLycTPM$spen_polgerm
+plot(seq(1,length(differenceTest)), differenceTest)
+
+#here I aggregated the pollen and leaf columns in order to avoid artificially lowering tissue bias marks from Tau. s is for "select" and is for the function that removes columns in dplyr
+sPenTPM <- PenTPM %>%
+  add_column(pollen = rowMeans(PenTPM[,c("spen_polgerm","spen_polungerm")])) %>%
+  add_column(leaf = rowMeans(PenTPM[,c("spen_leafP3P4", "spen_leafP5P6")])) %>%
+  dplyr::select(-c(spen_leafP3P4,spen_leafP5P6,spen_polungerm,spen_polgerm))
+
+sLycTPM <- LycTPM %>%
+  add_column(pollen = rowMeans(LycTPM[,c("slyc_polgerm","slyc_polungerm")])) %>%
+  add_column(leaf = rowMeans(LycTPM[,c("slyc_leafP3P4", "slyc_leafP5P6")])) %>%
+  dplyr::select(-c(slyc_leafP3P4,slyc_leafP5P6,slyc_polungerm,slyc_polgerm))
+#tau function provided by Brooke P
+tau<-function(x){
+  if(any(is.na(x))) stop('NA\'s need to be 0.')
+  if(any(x<0)) stop('Negative input values not permitted.')
+  t<-sum(1-x/max(x))/(length(x)-1)
+}
+#replace everything <1 TPM with NA
+Pen_NA <- replace(sPenTPM, sPenTPM < 1, NA)
+
+#log transform (just the data without transcript IDs)
+Pen_NA_log <- log2(Pen_NA[,2:4])
+
+#replace NAs with 0
+Pen_log <- replace(Pen_NA_log, is.na(Pen_NA_log), 0)
+
+#calculate tau and create new column with tau values
+Pen_log$tau <- apply(Pen_log, 1, tau)
+
+#add transcript IDs back to dataset
+Pen_tau <- cbind(sPenTPM[,1], Pen_log)
+names(Pen_tau)[names(Pen_tau)=='sPenTPM[, 1]'] <-"GeneID"
+
+#REPEATED FOR LYCO
+#replace everything <1 TPM with NA
+Lyc_NA <- replace(sLycTPM, sLycTPM < 1, NA)
+
+#log transform (just the data without transcript IDs)
+Lyc_NA_log <- log2(Lyc_NA[,2:4])
+
+#replace NAs with 0
+Lyc_log <- replace(Lyc_NA_log, is.na(Lyc_NA_log), 0)
+
+#calculate tau and create new column with tau values
+Lyc_log$tau <- apply(Lyc_log, 1, tau)
+
+#add transcript IDs back to dataset
+Lyc_tau <- cbind(sLycTPM[,1], Lyc_log)
+names(Lyc_tau)[names(Lyc_tau)=='sLycTPM[, 1]'] <-"GeneID"
+
+#modifying to be in a better format for ggplot
+names(Pen_tau)[names(Pen_tau)=='spen_styungerm'] <-"styungerm"
+
+longPen_tau <- Pen_tau %>% 
+  add_column('species'='pen') %>%
+  gather(key=tissue,value=log2Expression, 2:4)
+
+names(Lyc_tau)[names(Lyc_tau)=='slyc_styungerm'] <-"styungerm"
+
+longLyc_tau<-Lyc_tau %>% 
+  add_column('species'='lyc') %>%
+  gather(key=tissue,value=log2Expression, 2:4)
+
+long_tau <- rbind(longLyc_tau,longPen_tau)
+
+#Repeated here for keeping tissues separate
+##Another repeat for Pen with tissues not averaged
+#replace everything <1 TPM with NA
+Pen_NA <- replace(PenTPM, PenTPM < 1, NA)
+
+#log transform (just the data without transcript IDs)
+Pen_NA_log <- log2(Pen_NA[,2:6])
+
+#replace NAs with 0
+Pen_log <- replace(Pen_NA_log, is.na(Pen_NA_log), 0)
+
+#calculate tau and create new column with tau values
+Pen_log$tau <- apply(Pen_log, 1, tau)
+
+#add transcript IDs back to dataset
+separatePen_tau <- cbind(PenTPM[,1], Pen_log)
+names(separatePen_tau)[names(separatePen_tau)=='PenTPM[, 1]'] <-"GeneID"
+
+##another repeat for Lyc tissues not averaged
+#replace everything <1 TPM with NA
+Lyc_NA <- replace(LycTPM, LycTPM < 1, NA)
+
+#log transform (just the data without transcript IDs)
+Lyc_NA_log <- log2(Lyc_NA[,2:6])
+
+#replace NAs with 0
+Lyc_log <- replace(Lyc_NA_log, is.na(Lyc_NA_log), 0)
+
+#calculate tau and create new column with tau values
+Lyc_log$tau <- apply(Lyc_log, 1, tau)
+
+#add transcript IDs back to dataset
+separateLyc_tau <- cbind(LycTPM[,1], Lyc_log)
+names(separateLyc_tau)[names(separateLyc_tau)=='LycTPM[, 1]'] <-"GeneID"
+
+#modifying to be in a better format for ggplot
+names(separatePen_tau)[names(separatePen_tau)=='spen_styungerm'] <-"styungerm"
+names(separatePen_tau)[names(separatePen_tau)=='spen_polgerm'] <-"polgerm"
+names(separatePen_tau)[names(separatePen_tau)=='spen_polungerm'] <-"polungerm"
+names(separatePen_tau)[names(separatePen_tau)=='spen_leafP3P4'] <-"leafP3P4"
+names(separatePen_tau)[names(separatePen_tau)=='spen_leafP5P6'] <-"leafP5P6"
+separateLongPen_tau <- separatePen_tau %>% 
+  add_column('species'='pen') %>%
+  gather(key=tissue,value=log2Expression, 2:6)
+
+names(separateLyc_tau)[names(separateLyc_tau)=='slyc_styungerm'] <-"styungerm"
+names(separateLyc_tau)[names(separateLyc_tau)=='slyc_polgerm'] <-"polgerm"
+names(separateLyc_tau)[names(separateLyc_tau)=='slyc_polungerm'] <-"polungerm"
+names(separateLyc_tau)[names(separateLyc_tau)=='slyc_leafP3P4'] <-"leafP3P4"
+names(separateLyc_tau)[names(separateLyc_tau)=='slyc_leafP5P6'] <-"leafP5P6"
+
+separateLongLyc_tau<-separateLyc_tau %>% 
+  add_column('species'='lyc') %>%
+  gather(key=tissue,value=log2Expression, 2:6)
+
+separateLong_tau <- rbind(separateLongLyc_tau,separateLongPen_tau)
+```
+
+
+#section for adding PMEs and PMEIs to long_tau dataset
+```{r}
+
+
+long_tau$PME <- FALSE
+long_tau$PMEI <- FALSE
+
+for(geneRow in 1:nrow(long_tau)) {
+  print(substr(long_tau$GeneID[geneRow],1,14))
+  
+  long_tau$PME[geneRow] = 
+    substr(long_tau$GeneID[geneRow], 1, 14) %in% newPMEs
+  long_tau$PMEI[geneRow] = 
+    substr(long_tau$GeneID[geneRow], 1, 14) %in% newPMEIs
+}
+
+
+```
+
+#Section for summary stats, comparisons, and statistical tests
+```{r}
+#counting number of genes biased to certain tissues
+long_tau %>%
+  unite('SpBias',c(species,biased),remove = F) %>%
+  dplyr::count(.,SpBias)
+#comparing expression of biased genes
+sum(long_tau$log2Expression[which(long_tau$species=='lyc' & long_tau$biased=='pollen')])
+sum(long_tau$log2Expression[which(long_tau$species=='pen' & long_tau$biased=='pollen')])
+sum(long_tau$log2Expression[which(long_tau$species=='lyc' & long_tau$biased=='leaf')])
+sum(long_tau$log2Expression[which(long_tau$species=='pen' & long_tau$biased=='leaf')])
+sum(long_tau$log2Expression[which(long_tau$species=='lyc' & long_tau$biased=='styungerm')])
+sum(long_tau$log2Expression[which(long_tau$species=='pen' & long_tau$biased=='styungerm')])
+#PME/PMEI summary stats
+long_tau %>%
+  unite('SpBiasPME',c(species,biased, PME), remove = F) %>%
+  dplyr::count(.,SpBiasPME)
+long_tau %>%
+  unite('SpBiasPMEI',c(species,biased, PMEI), remove = F) %>%
+  count(.,SpBiasPMEI)
+
+#Takes out effect of species on the effect of PME on tau and tests using a linear regression (an ANOVA)
+PMEonTau <- lm(tau_test_data$tau ~ as.factor(tau_test_data$PME) + as.factor(tau_test_data$species))
+summary(PMEonTau)
+#Takes out effect of species on the effect of PMEI on tau and tests using a linear regression (an ANOVA)
+PMEIonTau <- lm(tau_test_data$tau ~ as.factor(tau_test_data$PMEI) + as.factor(tau_test_data$species))
+summary(PMEIonTau)
+
+#linear model (ANOVA) for above graphs
+#PME not absolute difference
+LeafExpressPME<-lm(differenceDf$LeafDiff ~ as.factor(differenceDf$PME))
+summary(LeafExpressPME)
+PollenExpressPME<-lm(differenceDf$PolDiff ~ as.factor(differenceDf$PME))
+summary(PollenExpressPME)
+StyleExpressPME<-lm(differenceDf$StyDiff ~ as.factor(differenceDf$PME)) #This one has a significant effect, more towards pennellii
+summary(StyleExpressPME)
+#PME absolute difference
+absLeafExpressPME<-lm(differenceDf$absLeafDiff ~ as.factor(differenceDf$PME)) #almost significant, but not
+summary(absLeafExpressPME)
+absPollenExpressPME<-lm(differenceDf$absPolDiff ~ as.factor(differenceDf$PME))
+summary(absPollenExpressPME)
+StyleExpressPME<-lm(differenceDf$absStyDiff ~ as.factor(differenceDf$PME)) #significant, but lower change?
+summary(absStyleExpressPME)
+#PMEI difference
+LeafExpressPMEI<-lm(differenceDf$LeafDiff ~ as.factor(differenceDf$PMEI))
+summary(LeafExpressPMEI)
+PollenExpressPMEI<-lm(differenceDf$PolDiff ~ as.factor(differenceDf$PMEI))
+summary(PollenExpressPMEI)
+StyleExpressPMEI<-lm(differenceDf$StyDiff ~ as.factor(differenceDf$PMEI)) #this one has a significant effect, more towards pennellii
+summary(StyleExpressPMEI)
+#PMEI absolute difference (no significance)
+absLeafExpressPMEI<-lm(differenceDf$absLeafDiff ~ as.factor(differenceDf$PMEI))
+summary(absLeafExpressPMEI)
+absPollenExpressPMEI<-lm(differenceDf$absPolDiff ~ as.factor(differenceDf$PMEI))
+summary(absPollenExpressPMEI)
+absStyleExpressPMEI<-lm(differenceDf$absStyDiff ~ as.factor(differenceDf$PMEI))
+summary(absStyleExpressPMEI)
+```
+
+#Adding StErr to long_tau dataset so I can more easily use ggplot
+```{r}
+masterDF <-PenLycTPMLog2StErr  %>%
+  select(., c(GeneID, spen_styungermStErr,spen_pollenStErr,spen_leafStErr,slyc_styungermStErr,slyc_pollenStErr,slyc_leafStErr)) %>% #Selects only the standard error for the tissue classes present in the long_tau dataframe
+  pivot_longer(., cols = c(2:7), #pivots the 6 standard error columns and separates them into species, tissue, and a column with values for error
+               names_to = c("species","tissue"), 
+               names_sep = "_", 
+               values_to = "Error") %>%
+  arrange(.,species,desc(tissue)) %>% #reorders the columns in the same way the long_tau dataframe is made. Might be redundant with the 'by' command in the left_join function
+  mutate_at("tissue", stringr::str_replace,"StErr","") %>% #removes the StErr from tissues so they can be matched better by the 'by' command in left_join
+  mutate_at("species", stringr::str_replace,"s","") %>% #same idea as in the previous comment
+  left_join(long_tau,.,by=c('GeneID','species','tissue')) #left_joins this dataframe to long_tau, only combining columns that match for GeneID, species, and tissue
+
+masterDF <- masterDF %>%
+  unite('SpTis',c(species,tissue), remove = F)
+
+notInLeaf <-masterDF %>% #replaced long_tau with masterDF because its the one I have saved
+  filter(tissue=='leaf') %>%
+  filter(TPM <=2) %>%
+  filter(tau >=.65) %>%
+  filter(biased=='general') %>%
+  filter(duplicated(GeneID) | duplicated(GeneID, fromLast=TRUE))
+```
+
+#Section for calculating absolute expression
+```{r}
+masterDF <- masterDF %>%
+  add_column(TPM = 2^(masterDF$log2Expression)) %>%
+  mutate(TPM=replace(TPM,TPM ==1,0))
+write_csv(masterDF, file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/masterDF.txt')
+masterDF = data.frame(read.csv('/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/masterDF.txt', sep = ',' ))
+view(masterDF)
+```
+
+#Section for absolute expression summary statistics
+```{r} 
+#Lycopersicum PME amount in style and pollen (60873.55TPM)
+masterDF %>%
+  filter(PME==T) %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(species=='lyc') %>%
+  filter(!tissue == 'leaf') %>%
+  numcolwise(sum)(.)
+#Lycopersicum PMEI amount in style and pollen (10692.15TPM)
+masterDF %>%
+  filter(PMEI==T) %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(species=='lyc') %>%
+  filter(!tissue == 'leaf') %>%
+  numcolwise(sum)(.)
+#Pennellii PME amount in style and pollen (53120.27TPM)
+masterDF %>%
+  filter(PME==T) %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(species=='pen') %>%
+  filter(!tissue == 'leaf') %>%
+  numcolwise(sum)(.)
+#Pennellii PMEI amount in style and pollen (7583.714TPM)
+masterDF %>%
+  filter(PMEI==T) %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(species=='pen') %>%
+  filter(!tissue == 'leaf') %>%
+  numcolwise(sum)(.)
+#Lycopersicum PME amount in pollen (60788.08TPM)
+masterDF %>%
+  filter(PME==T) %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(species=='lyc') %>%
+  filter(tissue=='pollen') %>%
+  numcolwise(sum)(.)
+#Lycopersicum PME amount in style (85.47394TPM)
+masterDF %>%
+  filter(PME==T) %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(species=='lyc') %>%
+  filter(tissue=='styungerm') %>%
+  numcolwise(sum)(.)
+#Lycopersicum PMEI amount in pollen (10673.13TPM)
+masterDF %>%
+  filter(PMEI==T) %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(species=='lyc') %>%
+  filter(tissue=='pollen') %>%
+  numcolwise(sum)(.)
+#Lycopersicum PMEI amount in style (19.02499TPM)
+masterDF %>%
+  filter(PMEI==T) %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(species=='lyc') %>%
+  filter(tissue=='styungerm') %>%
+  numcolwise(sum)(.)
+#Pennellii PME amount in pollen (51987.35TPM)
+masterDF %>%
+  filter(PME==T) %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(species=='pen') %>%
+  filter(tissue == 'pollen') %>%
+  numcolwise(sum)(.)
+#Pennellii PME amount in style (1132.926TPM)
+masterDF %>%
+  filter(PME==T) %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(species=='pen') %>%
+  filter(tissue == 'styungerm') %>%
+  numcolwise(sum)(.)
+#Pennellii PMEI amount in pollen (7147.84TPM)
+masterDF %>%
+  filter(PMEI==T) %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(species=='pen') %>%
+  filter(tissue == 'pollen') %>%
+  numcolwise(sum)(.)
+#Pennellii PMEI amount in style (435.8739TPM)
+masterDF %>%
+  filter(PMEI==T) %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(species=='pen') %>%
+  filter(tissue == 'styungerm') %>%
+  numcolwise(sum)(.)
+
+
+
+
+TissueEnzyme <- c("Total PME", "Pollen PME", "Style PME", "Total PMEI", "Pollen PMEI", "Style PMEI")
+Lycopersicum <- c(60873.6,60788.1,85.5,10692.2,10673.1,19.0)
+Pennellii <- c(53120.3,51987.4,1132.9,7583.7,7147.8,435.9)
+summarySums <- data.frame(TissueEnzyme,Lycopersicum,Pennellii)
+write_xlsx(summarySums, "~/Desktop/PMEDifferentialGeneExpExp/data/summaryPMEPMEITPM.xlsx")
+
+summarySumsPenn <- summarySums %>%
+  select(c(TissueEnzyme, Pennellii)) %>%
+  add_column(Species = "pen") %>%
+  rename("Expression" = Pennellii)
+
+longSummarySums <- summarySums %>%
+  select(c(TissueEnzyme, Lycopersicum)) %>%
+  add_column(Species = "lyco") %>%
+  rename("Expression" = Lycopersicum) %>%
+  bind_rows(summarySumsPenn)
+  
+```
+
+#Section for making poster plots
+```{r}
+masterDF <- masterDF %>%
+  mutate(log10Expression = log10(2^log2Expression)) %>%
+  mutate(log10Error = log10(2^Error)) %>%
+  mutate(TPMError = 2^Error)
+
+
+
+tissueLabels <- c("leaf", "pollen", "style")
+#with log2 Expression
+masterDF %>%
+  unite('SpTis',species:tissue,remove = F) %>%
+  filter(!biased=='general') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  mutate(tissue = replace(tissue, tissue == "styungerm", "style")) %>%
+  mutate(species = replace(species, species == "lyc", "S. lycopersicum")) %>%
+  mutate(species = replace(species, species == "pen", "S. pennellii")) %>%
+  ggplot(aes(x=tau, y=log2Expression, color=species, shape=species)) +
+  geom_point(size=.5) +
+  facet_wrap(~tissue) +
+  xlab("Tissue Bias") + 
+  ylab("Gene Expression (log base 2)")  +
+  scale_color_manual(values = c("#311432","#ff6700")) +
+  scale_shape_manual(values = c(17,16)) +
+  theme_classic() +
+  theme(legend.position = c(0.15, 0.9),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        axis.text = element_text(size = 8), 
+        axis.title = element_text(size = 8), 
+        panel.spacing = unit(0.7, "cm"))
+
+#making this to show PMEs & PMEIS
+masterDF %>%
+  unite('SpTis',species:tissue,remove = F) %>%
+  filter(!biased=='general') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  mutate(tissue = replace(tissue, tissue == "styungerm", "style")) %>%
+  mutate(species = replace(species, species == "lyc", "S. lycopersicum")) %>%
+  mutate(species = replace(species, species == "pen", "S. pennellii")) %>%
+  ggplot(aes(x=tau, y=log2Expression, color=PME, shape=species)) +
+  geom_point(size=4.0) +
+  facet_wrap(~tissue) +
+  xlab("Tissue Bias") + 
+  ylab("Gene Expression (log base 2)") +
+  theme(legend.position = c(0.15, 0.9),
+        legend.text = element_text(size = 36), 
+        legend.title = element_text(size = 40), 
+        strip.text = element_text(size = 40), 
+        axis.text = element_text(size = 36), 
+        axis.title = element_text(size = 40), 
+        panel.spacing = unit(0.7, "cm"))
+
+masterDF %>%
+  unite('SpTis',species:tissue,remove = F) %>%
+  filter(!biased=='general') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  mutate(tissue = replace(tissue, tissue == "styungerm", "style")) %>%
+  mutate(species = replace(species, species == "lyc", "S. lycopersicum")) %>%
+  mutate(species = replace(species, species == "pen", "S. pennellii")) %>%
+  ggplot(aes(x=tau, y=log2Expression, color=PMEI, shape=species)) +
+  geom_point(size=4.0) +
+  facet_wrap(~tissue) +
+  xlab("Tissue Bias") + 
+  ylab("Gene Expression (log base 2)") +
+  theme(legend.position = c(0.15, 0.9),
+        legend.text = element_text(size = 36), 
+        legend.title = element_text(size = 40), 
+        strip.text = element_text(size = 40), 
+        axis.text = element_text(size = 36), 
+        axis.title = element_text(size = 40), 
+        panel.spacing = unit(0.7, "cm"))
+#with log10 Expression
+masterDF %>%
+  unite('SpTis',species:tissue,remove = F) %>%
+  filter(!biased=='general') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  mutate(tissue = replace(tissue, tissue == "styungerm", "style")) %>%
+  mutate(species = replace(species, species == "lyc", "S. lycopersicum")) %>%
+  mutate(species = replace(species, species == "pen", "S. pennellii")) %>%
+  ggplot(aes(x=tau, y=log10Expression, color=species, shape=species)) +
+  geom_point(size=4.0) +
+  facet_wrap(~tissue) +
+  xlab("Tissue Bias") + 
+  ylab("Gene Expression (log base 10 TPM)") +
+  theme(legend.position = c(0.15, 0.9),
+        legend.text = element_text(size = 36), 
+        legend.title = element_text(size = 40), 
+        strip.text = element_text(size = 40), 
+        axis.text = element_text(size = 36), 
+        axis.title = element_text(size = 40), 
+        panel.spacing = unit(0.7, "cm"))
+
+masterDF %>%
+  filter(GeneID %in% swoopGenes$GeneID)  %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_leaf','lyc_leaf','pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point() +
+  geom_line(aes(colour=GeneID,group=GeneIDTis )) +
+  scale_x_discrete(labels=c("pen_leaf" = "S. pennellii leaf", 
+                            "lyc_leaf" = "S. lycopersicum leaf",
+                            "pen_pollen" = "S. pennellii pollen", 
+                            "lyc_pollen" = "S. lycopersicum pollen", 
+                            "pen_styungerm" = "S. pennellii style", 
+                            "lyc_styungerm" = "S. lycopersicum style")) +
+  theme(legend.position="none") +
+  labs(title = 'High Expression Pollen Biased Genes',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)') + 
+  theme(axis.text = element_text(size = 36), 
+        axis.title = element_text(size = 40),
+        title = element_text(size = 44),
+        axis.text.x = element_text(angle = 35, hjust = 1)) 
+
+masterDF %>%
+  filter(PME==T)  %>%
+  filter(GeneID %in% notInLeaf$GeneID)  %>%
+  filter(tissue != 'leaf') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 6) +
+  geom_line(aes(colour=GeneID,group=GeneIDTis, size = 5 )) + 
+  scale_x_discrete(labels=c(
+                            "pen_pollen" = "S. pennellii pollen",
+                            "lyc_pollen" = "S. lycopersicum pollen", 
+                            "pen_styungerm" = "S. pennellii style", 
+                            "lyc_styungerm" = "S. lycopersicum style")) +
+  theme(legend.position="none") +
+  labs(title = 'Reproductive Tissue PMEs',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)') #+ 
+  # theme(axis.text = element_text(size = 24), 
+  #       axis.title = element_text(size = 30),
+  #       title = element_text(size = 35),
+  #       axis.text.x = element_text(angle = 35, hjust = 1)) 
+
+masterDF %>%
+  filter(PMEI==T)  %>%
+  filter(GeneID %in% notInLeaf$GeneID)  %>%
+  filter(tissue != 'leaf') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 6) +
+  geom_line(aes(colour=GeneID,group=GeneIDTis, size = 5 )) +
+  scale_x_discrete(labels=c("pen_pollen" = "S. pennellii pollen",
+                            "lyc_pollen" = "S. lycopersicum pollen", 
+                            "pen_styungerm" = "S. pennellii style", 
+                            "lyc_styungerm" = "S. lycopersicum style")) +
+  theme(legend.position="none") +
+  labs(title = 'Reproductive Tissue PMEIs',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)') + 
+  theme(axis.text = element_text(size = 25), 
+        axis.title = element_text(size = 30),
+        title = element_text(size = 35),
+        axis.text.x = element_text(angle = 35, hjust = 1)) 
+
+longSummarySums <- as.data.frame(longSummarySums)
+longSummarySums %>%
+  mutate(Species = replace(Species, Species == "lyco", "S. lycopersicum")) %>%
+  mutate(Species = replace(Species, Species == "pen", "S. pennellii")) %>%
+  unite('SpTis', c(Species, TissueEnzyme), remove = F) %>% 
+  mutate(log10Expression = log10(Expression)) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('S. pennellii_Total PME',
+                                        'S. lycopersicum_Total PME',
+                                        'S. pennellii_Pollen PME',
+                                        'S. lycopersicum_Pollen PME',
+                                        'S. pennellii_Style PME',
+                                        'S. lycopersicum_Style PME', 
+                                        'S. pennellii_Total PMEI', 
+                                        'S. lycopersicum_Total PMEI',
+                                        'S. pennellii_Pollen PMEI', 
+                                        'S. lycopersicum_Pollen PMEI',
+                                        'S. pennellii_Style PMEI',
+                                        'S. lycopersicum_Style PMEI')), 
+             y=log10Expression, 
+             color = Species)) +
+  geom_point(size=5) + 
+  ylim(0,5) +
+  scale_fill_discrete(name="Species",labels = c("S. lycopersicum", "S. pennellii")) +  
+  geom_line(aes(group=TissueEnzyme), 
+            color=c("Black", "Black","Black", "Black","Black", "Black","Black", "Black","Black", "Black","Black", "Black")) +
+  scale_x_discrete(labels=c("S. pennellii_Total PME" = "S. pennellii Total PME",
+                            "S. lycopersicum_Total PME" = "S. lycopersicum Total PME",
+                            "S. pennellii_Pollen PME" = "S. pennellii pollen PME",
+                            "S. lycopersicum_Pollen PME" = "S. lycopersicum pollen PME", 
+                            "S. pennellii_Style PME" = "S. pennellii style PME", 
+                            "S. lycopersicum_Style PME" = "S. lycopersicum style PME", 
+                            "S. pennellii_Total PMEI" = "S. pennellii Total PMEI",
+                            "S. lycopersicum_Total PMEI" = "S. lycopersicum Total PMEI",
+                            "S. pennellii_Pollen PMEI" = "S. pennellii pollen PMEI",
+                            "S. lycopersicum_Pollen PMEI" = "S. lycopersicum pollen PMEI", 
+                            "S. pennellii_Style PMEI" = "S. pennellii style PMEI", 
+                            "S. lycopersicum_Style PMEI" = "S. lycopersicum style PMEI")) + 
+  labs(title = 'Reproductive Tissue PME & PMEIs',
+       x='Species, Tissue, & Enzyme',
+       y='Gene Expression (log base 10 TPM)') + 
+  theme(axis.text = element_text(size = 36), 
+        axis.title = element_text(size = 40),
+        title = element_text(size = 44),
+        axis.text.x = element_text(angle = 35, hjust = 1),
+        legend.text = element_text(size=36)) 
+#plot with all reproductive genes
+masterDF %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_leaf','lyc_leaf','pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point() +
+  geom_line(aes(colour=GeneID,group=GeneIDTis )) + 
+  scale_x_discrete(labels=c("pen_leaf" = "S. pennellii leaf",
+                            "lyc_leaf" = "S. lycopersicum leaf",
+                            "pen_pollen" = "S. pennellii pollen",
+                            "lyc_pollen" = "S. lycopersicum pollen", 
+                            "pen_styungerm" = "S. pennellii style", 
+                            "lyc_styungerm" = "S. lycopersicum style")) +
+  theme(legend.position="none") +
+  labs(title = 'Reproductive Tissue Genes',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)') #+ 
+  # theme(axis.text = element_text(size = 36), 
+  #       axis.title = element_text(size = 40),
+  #       title = element_text(size = 44),
+  #       axis.text.x = element_text(angle = 35, hjust = 1)) 
+#repeat of last plot but not logged
+masterDF %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_leaf','lyc_leaf','pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=TPM,
+             ymax=TPM+TPMError,
+             ymin=TPM-TPMError)) +
+  geom_errorbar(width=0.1) +
+  geom_point() +
+  geom_line(aes(colour=GeneID,group=GeneIDTis )) + 
+  scale_x_discrete(labels=c("pen_leaf" = "S. pennellii leaf",
+                            "lyc_leaf" = "S. lycopersicum leaf",
+                            "pen_pollen" = "S. pennellii pollen",
+                            "lyc_pollen" = "S. lycopersicum pollen", 
+                            "pen_styungerm" = "S. pennellii style", 
+                            "lyc_styungerm" = "S. lycopersicum style")) +
+  theme(legend.position="none") +
+  labs(title = 'Reproductive Tissue Genes',
+       x='Species & Tissue',
+       y='Gene Expression (TPM)') #+ 
+  # theme(axis.text = element_text(size = 36), 
+  #       axis.title = element_text(size = 40),
+  #       title = element_text(size = 44),
+  #       axis.text.x = element_text(angle = 35, hjust = 1)) 
+
+#making a list of all pollen biased genes so I can filter using the %in% command for masterDF. Limited the genes to those that have greater than 2 TPM expression in both species
+pollenBiased <- masterDF %>%
+  filter(biased == "pollen") %>%
+  filter(TPM > 2) %>%
+  filter(duplicated(GeneID) | duplicated(GeneID, fromLast=TRUE))
+
+masterDF %>%
+  filter(GeneID %in% pollenBiased$GeneID) %>%
+  filter(tissue != 'leaf') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point() +
+  geom_line(aes(colour=GeneID,group=GeneIDTis )) + 
+  scale_x_discrete(labels=c("pen_pollen" = "Sp. pollen",
+                            "lyc_pollen" = "Sl. pollen", 
+                            "pen_styungerm" = "Sp. style", 
+                            "lyc_styungerm" = "Sl. style")) +
+  theme(legend.position="none") +
+  labs(title = 'Pollen Biased Genes',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)') #+ 
+  # theme(axis.text = element_text(size = 36), 
+  #       axis.title = element_text(size = 40),
+  #       title = element_text(size = 44),
+  #       axis.text.x = element_text(angle = 35, hjust = 1)) 
+
+styleBiased <- masterDF %>%
+  filter(biased == "styungerm") %>%
+  filter(TPM > 2) %>%
+  filter(duplicated(GeneID) | duplicated(GeneID, fromLast=TRUE))
+
+leafBiased <- masterDF %>%
+  filter(biased == "leaf") %>%
+  filter(TPM > 2) %>%
+  filter(duplicated(GeneID) | duplicated(GeneID, fromLast=TRUE))
+
+masterDF %>%
+  filter(GeneID %in% styleBiased$GeneID) %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_leaf','lyc_leaf','pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point() +
+  geom_line(aes(colour=GeneID,group=GeneIDTis )) + 
+  scale_x_discrete(labels=c("pen_leaf" = "S. pennellii leaf",
+                            "lyc_leaf" = "S. lycopersicum leaf",
+                            "pen_pollen" = "S. pennellii pollen",
+                            "lyc_pollen" = "S. lycopersicum pollen", 
+                            "pen_styungerm" = "S. pennellii style", 
+                            "lyc_styungerm" = "S. lycopersicum style")) +
+  theme(legend.position="none") +
+  labs(title = 'Style Biased Genes',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)') + 
+  theme(axis.text = element_text(size = 36), 
+        axis.title = element_text(size = 40),
+        title = element_text(size = 44),
+        axis.text.x = element_text(angle = 35, hjust = 1)) 
+
+
+masterDF %>%
+  filter(GeneID %in% pollenBiased$GeneID) %>%
+  filter(tissue %in% c("pollen", "styungerm")) %>%
+  unite('GeneIDSp',c(GeneID,species),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','pen_styungerm','lyc_pollen','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point() +
+  geom_line(aes(colour=GeneID,group=GeneIDSp )) + 
+  scale_x_discrete(labels=c("pen_pollen" = "S. pennellii pollen",
+                            "lyc_pollen" = "S. lycopersicum pollen", 
+                            "pen_styungerm" = "S. pennellii style", 
+                            "lyc_styungerm" = "S. lycopersicum style")) +
+  theme(legend.position="none") +
+  labs(title = 'Pollen Biased Genes',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)') + 
+  theme(axis.text = element_text(size = 36), 
+        axis.title = element_text(size = 40),
+        title = element_text(size = 44),
+        axis.text.x = element_text(angle = 35, hjust = 1)) 
+
+masterDF %>%
+  filter(tissue == "leaf") %>%
+  filter(GeneID %in% leafBiased$GeneID) %>%
+  ggplot(aes(x=species, y=log2Expression)) +
+  geom_boxplot()
+```
+
+#More statistical tests Leonie asked for
+```{r}
+#Checking if there is an difference in the average pollen expression of pollen biased genes between species
+pollenExpressionPollenBiased <- masterDF %>%
+  filter(GeneID %in% pollenBiased$GeneID) %>%
+  filter(tissue == "pollen")
+
+pEPB <- lm(pollenExpressionPollenBiased$TPM ~ as.factor(pollenExpressionPollenBiased$species))
+summary(pEPB)
+
+average_TPM_by_species <- pollenExpressionPollenBiased %>%
+  group_by(species) %>%
+  summarise(Average_TPM = mean(TPM, na.rm = TRUE))
+
+# View the result
+View(average_TPM_by_species)
+#Checking if there is an difference in the average style expression of pollen biased genes between species
+styleExpressionPollenBiased <- masterDF %>%
+  filter(GeneID %in% pollenBiased$GeneID) %>%
+  filter(tissue == "styungerm")
+
+sEPB <- lm(styleExpressionPollenBiased$TPM ~ as.factor(styleExpressionPollenBiased$species))
+summary(sEPB)
+
+average_TPM_by_species <- styleExpressionPollenBiased %>%
+  group_by(species) %>%
+  summarise(Average_TPM = mean(TPM, na.rm = TRUE))
+
+# View the result
+View(average_TPM_by_species)
+
+#Checking if there is an difference in the average leaf expression of pollen biased genes between species
+leafExpressionPollenBiased <- masterDF %>%
+  filter(GeneID %in% pollenBiased$GeneID) %>%
+  filter(tissue == "leaf")
+
+lEPB <- lm(leafExpressionPollenBiased$TPM ~ as.factor(leafExpressionPollenBiased$species))
+summary(lEPB)
+
+#Checking if there is a difference in the tau of pollen biased genes between species
+tauPB <- lm(pollenExpressionPollenBiased$tau ~ as.factor(pollenExpressionPollenBiased$species))
+summary(tauPB)
+
+#Checking if there is a difference in the tau and expression of leaf and biased genes between species
+leafExpressionLeafBiased <- masterDF %>%
+  dplyr::filter(GeneID %in% leafBiased$GeneID) %>%
+  dplyr::filter(tissue == "leaf")
+tauLB <- lm(leafExpressionLeafBiased$tau ~ as.factor(leafExpressionLeafBiased$species))
+summary(tauLB)
+
+tpmLB <- lm(leafExpressionLeafBiased$TPM ~ as.factor(leafExpressionLeafBiased$species))
+summary(tpmLB)
+
+styleExpressionStyleBiased <- masterDF %>%
+  filter(GeneID %in% styleBiased$GeneID) %>%
+  filter(tissue == "styungerm")
+tauSB <- lm(styleExpressionStyleBiased$tau ~ as.factor(styleExpressionStyleBiased$species))
+summary(tauSB)
+
+
+tpmSB <- lm(styleExpressionStyleBiased$TPM ~ as.factor(styleExpressionStyleBiased$species))
+summary(tpmSB)
+
+#checking if there is a difference in the pollen expression of pollen biased genes if they are PMEs
+PMEPB <-lm(pollenExpressionPollenBiased$TPM ~ as.factor(pollenExpressionPollenBiased$PME) + as.factor(pollenExpressionPollenBiased$species))
+summary(PMEPB)
+#PollenExpBiased <- lm(masterDF$ ~ as.factor(tau_test_data$PMEI) + as.factor(tau_test_data$species))
+#summary(PMEIonTau)
+#PMEIonTau <- lm(tau_test_data$tau ~ as.factor(tau_test_data$PMEI) + as.factor(tau_test_data$species))
+#summary(PMEIonTau)
+styleReproductive <- masterDF %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(tissue == 'styungerm')
+lycoReproductive <- styleReproductive[1:1595,]
+pennReproductive <- styleReproductive[1596:3190,]
+difference <- lycoReproductive$TPM - pennReproductive$TPM
+combinedDif <- append(difference, difference*-1)
+styleReproductive$difference <- combinedDif
+styleReproductiveLyc <- styleReproductive[1:1595,]
+difTest <- lm(styleReproductiveLyc$difference ~ as.factor(styleReproductiveLyc$PME))
+summary(difTest)
+
+pBSEDifference <- pollenBiased
+
+difTest <- lm(styleReproductiveLyc$difference ~ as.factor(styleReproductiveLyc$PMEI))
+summary(difTest)
+
+pollenReproductive <- masterDF %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(tissue == 'pollen')
+lycoReproductivePol <- pollenReproductive[1:1595,]
+pennReproductivePol <- pollenReproductive[1596:3190,]
+difference <- lycoReproductivePol$TPM - pennReproductivePol$TPM
+combinedDifPol <- append(difference, difference*-1)
+pollenReproductive$difference <- combinedDifPol
+pollenReproductiveLyc <- pollenReproductive[1:1595,]
+difTestPMEPol <- lm(pollenReproductiveLyc$difference ~ as.factor(pollenReproductiveLyc$PME))
+summary(difTestPMEPol)
+
+difTestPMEIPol <- lm(pollenReproductiveLyc$difference ~ as.factor(pollenReproductiveLyc$PMEI))
+summary(difTestPMEIPol)
+
+reproductivePMEs <- masterDF %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(PME == TRUE) %>%
+  filter(tissue == "styungerm")
+
+PMEStylarDifTest <- lm(reproductivePMEs$TPM ~ as.factor(reproductivePMEs$species))
+summary(PMEStylarDifTest)
+view(reproductivePMEs)
+  
+reproductivePMEIs <- masterDF %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(PMEI == TRUE) %>%
+  filter(tissue == "styungerm")
+
+PMEIStylarDifTest <- lm(reproductivePMEIs$TPM ~ as.factor(reproductivePMEIs$species))
+summary(PMEIStylarDifTest)
+
+# Load the necessary library
+library(broom)
+
+# Tidy up the output of the linear models
+tidy_PMEIStylarDifTest <- tidy(PMEIStylarDifTest)
+tidy_PMEStylarDifTest <- tidy(PMEStylarDifTest)
+
+# Write the tidied output to CSV files
+write.csv(tidy_PMEIStylarDifTest, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/PMEIStylarDifTest_summary.csv")
+write.csv(tidy_PMEStylarDifTest, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/PMEStylarDifTest_summary.csv")
+
+#Redoing pollen stats
+reproductivePMEsPollen <- masterDF %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(PME == TRUE) %>%
+  filter(tissue == "pollen") %>%
+  filter(biased == 'pollen')
+
+PMEPollenDifTest <- lm(reproductivePMEsPollen$TPM ~ as.factor(reproductivePMEsPollen$species))
+summary(PMEPollenDifTest)
+view(reproductivePMEsPollen)
+  
+reproductivePMEIsPollen <- masterDF %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(PMEI == TRUE) %>%
+  filter(tissue == "pollen") %>%
+  filter(biased == 'pollen')
+
+PMEIPollenDifTest <- lm(reproductivePMEIsPollen$TPM ~ as.factor(reproductivePMEIsPollen$species))
+summary(PMEIPollenDifTest)
+
+# Load the necessary library
+library(broom)
+
+# Tidy up the output of the linear models
+tidy_PMEIPollenDifTest <- tidy(PMEIPollenDifTest)
+tidy_PMEPollenDifTest <- tidy(PMEPollenDifTest)
+
+# Write the tidied output to CSV files
+write.csv(tidy_PMEIPollenDifTest, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/PMEIPollenDifTest_summary.csv")
+write.csv(tidy_PMEPollenDifTest, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/PMEPollenDifTest_summary.csv")
+
+
+
+styleExpressionPollenBiased <- masterDF %>% 
+  filter(GeneID %in% pollenBiased$GeneID) %>%
+  filter(tissue == "styungerm") 
+  
+
+styleDifference <- styleExpressionPollenBiased$TPM[1:779] - styleExpressionPollenBiased$TPM[780:1558]
+styleExpressionPollenBiased$difference <- styleDifference
+styleExpressionPollenBiased <- styleExpressionPollenBiased %>% filter(difference != 0) %>%
+  dplyr::filter(style_species_padj <= 0.05)
+
+write.csv(styleExpressionPollenBiased, file ='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/styleExpressedPollenBiased.txt')
+xx <- 0
+for(i in seq(1,length(styleDifference))){
+    if(styleDifference[i] == 0){
+      xx <- xx + 1
+    }
+  }
+styleDifferenceNoNega <- lapply(styleDifference, function(v){v[v<0] <- 0 ;v})
+
+
+
+filtered <- masterDF %>%
+  filter(PMEI == TRUE) %>%
+  filter(biased == 'styungerm')
+
+PMEImasterDF <- masterDF %>%
+  filter(PMEI == TRUE)
+
+PMEmasterDF <- masterDF %>%
+  filter(PME == TRUE)
+# Tidy up the output of the linear models
+tidy_difTestPMEIPol <- tidy(difTestPMEIPol)
+tidy_difTestPMEPol <- tidy(difTestPMEPol)
+
+# Write the tidied output to CSV files
+write.csv(tidy_difTestPMEIPol, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/PMEIPollenDifTest_summary.csv")
+write.csv(tidy_difTestPMEPol, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/PMEPollenDifTest_summary.csv")
+view(results_df)
+view(newPMEs)
+view(PMEMaster)
+#Filtering results_df to only reproductive specific PMEs
+PMEDeseq2Output <- results_df %>%
+  filter(Gene %in% notInLeaf$GeneID) %>%
+  filter(Gene %in% PMEmasterDF$GeneID) 
+
+view(PMEDeseq2Output)
+
+PMEIDeseq2Output <- results_df %>%
+  filter(Gene %in% notInLeaf$GeneID) %>%
+  filter(Gene %in% PMEImasterDF$GeneID) 
+view(PMEIDeseq2Output)
+```
+
+#Section for Trying out R Gene Ontology Tools
+```{r}
+#BiocManager::install("limma")
+#BiocManager::install("GO.db")
+#BiocManager::install("org.Hs.eg.db")
+
+
+#pBGIDGO <- goana(pollenBiasedGeneIDs)
+
+#saving here for a restart
+#write_csv(masterDF, file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/masterDF01082022.txt')
+masterDFNew = data.frame(read.csv('/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/masterDF01082022.txt', sep = ',' ))
+view(masterDFNew)
+#writing lists of geneID names for GO using panther
+pollenBiasedGeneIDs <- pollenBiased$GeneID[1:779]
+write_delim(as.data.frame(pollenBiasedGeneIDs), file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/pollenBiasedGeneIDs.txt', delim = " ")
+
+styleBiasedGeneIDs <- styleBiased$GeneID[1:892]
+write_delim(as.data.frame(styleBiasedGeneIDs), file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/styleBiasedGeneIDs.txt', delim = " ")
+
+leafBiasedGeneIDs <- leafBiased$GeneID[1:1410]
+write_delim(as.data.frame(leafBiasedGeneIDs), file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/leafBiasedGeneIDs.txt', delim = " ")
+
+#need it in this format to do statistical enrichment test in Panther
+lycPollenBiasedWithTPM <- masterDF %>%
+  filter(biased == "pollen") %>%
+  filter(species == "lyc") %>%
+  select(c(GeneID,TPM))
+
+write.table(lycPollenBiasedWithTPM, file = '/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/lycPollenBiasedWithTPM.txt', sep = "\t", row.names = F,col.names = F, quote = F)
+
+#Redoing with biased genes separated between groups
+lycoStyleBiasedList <- masterDF %>%
+  filter(species == "lyc") %>%
+  filter(tau >= 0.7) %>%
+  filter(tissue =="styungerm") %>%
+  filter(biased =="styungerm") %>%
+  dplyr::select(GeneID)
+
+write_delim(as.data.frame(lycoStyleBiasedList), file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/NewGO/lycoStyleBiasedList.txt', delim = " ")
+
+lycoPollenBiasedList <- masterDF %>%
+  filter(species == "lyc") %>%
+  filter(tau >= 0.7) %>%
+  filter(tissue =="pollen") %>%
+  filter(biased == "pollen") %>%
+  dplyr::select(GeneID)
+
+write_delim(as.data.frame(lycoPollenBiasedList), file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/NewGO/lycoPollenBiasedList.txt', delim = " ")
+
+lycoLeafBiasedList <- masterDF %>%
+  filter(species == "lyc") %>%
+  filter(tau >= 0.7) %>%
+  filter(tissue =="leaf") %>%
+  filter(biased == "leaf") %>%
+  dplyr::select(GeneID)
+
+write_delim(as.data.frame(lycoLeafBiasedList), file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/NewGO/lycoLeafBiasedList.txt', delim = " ")
+
+pennStyleBiasedList <- masterDF %>%
+  filter(species == "pen") %>%
+  filter(tau >= 0.7) %>%
+  filter(tissue =="styungerm") %>%
+  filter(biased =="styungerm") %>%
+  dplyr::select(GeneID)
+
+write_delim(as.data.frame(pennStyleBiasedList), file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/NewGO/pennStyleBiasedList.txt', delim = " ")
+
+pennPollenBiasedList <-masterDF %>%
+  filter(species == "pen") %>%
+  filter(tau >= 0.7) %>%
+  filter(tissue =="pollen") %>%
+  filter(biased == "pollen") %>%
+  dplyr::select(GeneID)
+
+write_delim(as.data.frame(pennPollenBiasedList), file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/NewGO/pennPollenBiasedList.txt', delim = " ")
+
+pennLeafBiasedList <- masterDF %>%
+  filter(species == "pen") %>%
+  filter(tau >= 0.7) %>%
+  filter(tissue =="leaf") %>%
+  filter(biased == "leaf") %>%
+  dplyr::select(GeneID)
+
+write_delim(as.data.frame(pennLeafBiasedList), file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/NewGO/pennLeafBiasedList.txt', delim = " ")
+
+#now I am making a list of all expressed genes in the dataset to compare the above lists against
+expressedGeneList <- masterDF %>%
+  filter(TPM >= 2) %>%
+  dplyr::select(GeneID) %>%
+  distinct()
+write_delim(as.data.frame(expressedGeneList), file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/NewGO/expressedGeneList.txt', delim = " ")
+
+```
+
+#Trying to get general dataset statistics
+```{r}
+#24588 tau == 1 (some duplicates from tissues where a gene is not expressed)
+#1298 pollen biased genes across both species (likely many shared)
+#681 lycopersicum pollen specific genes
+lycPollenSpecific <- masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(tau == 1) %>%
+  filter(biased == "pollen") %>%
+  filter(species == "lyc") %>%
+  select(GeneID) %>%
+  distinct()#Seems like there are some genes not marked as specific while being specific
+
+#1132 lycopersicum pollen biased genes
+lycPollenBiased <- masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(biased == "pollen") %>%
+  filter(species == "lyc") %>%
+  select(GeneID) %>%
+  distinct()
+
+#340 pennellii pollen specific genes
+penPollenSpecific <- masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(tau == 1) %>%
+  filter(biased == "pollen") %>%
+  filter(species == "pen") %>%
+  select(GeneID) %>%
+  distinct()
+
+#1027 pennellii pollen biased genes
+penPollenBiased <- masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(biased == "pollen") %>%
+  filter(species == "pen") %>%
+  select(GeneID) %>%
+  distinct()
+
+#1592 lycopersicum leaf specific genes
+lycLeafSpecific <- masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(tau == 1) %>%
+  filter(biased =="leaf") %>%
+  filter(species == "lyc") %>%
+  select(GeneID) %>%
+  distinct()
+
+#3813 lycopersicum leaf biased genes
+lycLeafBiased <- masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(biased =="leaf") %>%
+  filter(species == "lyc") %>%
+  select(GeneID) %>%
+  distinct()
+
+#1782 pennellii leaf specific genes
+penLeafSpecific <- masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(tau == 1) %>%
+  filter(biased =="leaf") %>%
+  filter(species == "pen") %>%
+  select(GeneID) %>%
+  distinct()
+
+#4155 pennellii leaf biased genes
+penLeafBiased <- masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(biased =="leaf") %>%
+  filter(species == "pen") %>%
+  select(GeneID) %>%
+  distinct()
+
+#645 lycopersicum style specific genes
+lycStyleSpecific <- masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(tau == 1) %>%
+  filter(biased =="styungerm") %>%
+  filter(species == "lyc") %>%
+  select(GeneID) %>%
+  distinct()
+
+#1711 lycopersicum style biased genes
+lycStyleBiased <- masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(biased =="styungerm") %>%
+  filter(species == "lyc") %>%
+  select(GeneID) %>%
+  distinct()
+
+#760 pennellii style specific genes
+penStyleSpecific <- masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(tau == 1) %>%
+  filter(biased =="styungerm") %>%
+  filter(species == "pen") %>%
+  select(GeneID) %>%
+  distinct()
+
+#1873 pennellii style biased genes
+penStyleBiased <- masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(biased =="styungerm") %>%
+  filter(species == "pen") %>%
+  select(GeneID) %>%
+  distinct()
+
+#testing to find the unions:
+#1380 pollen biased genes:
+union(lycPollenBiased$GeneID, penPollenBiased$GeneID)
+#840 pollen specific genes
+union(lycPollenSpecific$GeneID, penPollenSpecific$GeneID)
+#5424 leaf biased genes
+union(lycLeafBiased$GeneID, penLeafBiased$GeneID)
+#2519 leaf specific genes
+union(lycLeafSpecific$GeneID, penLeafSpecific$GeneID)
+#2692 style biased genes
+union(lycStyleBiased$GeneID, penStyleBiased$GeneID)
+#1151 style specific genes
+union(lycStyleSpecific$GeneID,penStyleSpecific$GeneID)
+
+#testing to find the intersect:
+#779 pollen biased genes:
+intersect(lycPollenBiased$GeneID, penPollenBiased$GeneID)
+#181 pollen specific genes
+intsectPollenSpecific <- intersect(lycPollenSpecific$GeneID, penPollenSpecific$GeneID)
+#2544 leaf biased genes
+intersect(lycLeafBiased$GeneID, penLeafBiased$GeneID)
+#855 leaf specific genes
+intersect(lycLeafSpecific$GeneID, penLeafSpecific$GeneID)
+#892 style biased genes
+intersect(lycStyleBiased$GeneID, penStyleBiased$GeneID)
+#254 style specific genes
+intersect(lycStyleSpecific$GeneID,penStyleSpecific$GeneID)
+
+#getting all expressed genes
+#19667 Genes expressed in Lyco
+lycoGenes <- masterDFNew %>%
+  filter(species == "lyc") %>%
+  filter(TPM > 2) %>%
+  distinct(GeneID)
+
+#19589 Genes expressed in Penn
+pennGenes <- masterDFNew %>%
+  filter(species == "pen") %>%
+  filter(TPM > 2) %>%
+  distinct(GeneID)
+
+#6143 genes expressed in lycopersicum pollen
+lycoPollenGenes <- masterDFNew %>%
+  filter(species == "lyc") %>%
+  filter(TPM > 2) %>%
+  filter(tissue == "pollen") %>%
+  select(GeneID) %>%
+  distinct(GeneID)
+
+#6030 genes expressed in pennellii pollen
+pennPollenGenes <- masterDFNew %>%
+  filter(species == "pen") %>%
+  filter(TPM > 2) %>%
+  filter(tissue == "pollen") %>%
+  select(GeneID) %>%
+  distinct(GeneID)
+
+#16200 genes expressed in lycopersicum style
+lycoStyleGenes <- masterDFNew %>%
+  filter(species == "lyc") %>%
+  filter(TPM > 2) %>%
+  filter(tissue == "styungerm") %>%
+  select(GeneID) %>%
+  distinct(GeneID)
+
+#16315 genes expressed in pennellii style
+pennStyleGenes <- masterDFNew %>%
+  filter(species == "pen") %>%
+  filter(TPM > 2) %>%
+  filter(tissue == "styungerm") %>%
+  distinct(GeneID)
+
+#17418 genes expressed in lycopersicum leaf
+lycoLeafGenes <- masterDFNew %>%
+  filter(species == "lyc") %>%
+  filter(TPM > 2) %>%
+  filter(tissue == "leaf") %>%
+  select(GeneID) %>%
+  distinct(GeneID)
+
+#17234 genes expressed in pennellii leaf
+pennLeafGenes <- masterDFNew %>%
+  filter(species == "pen") %>%
+  filter(TPM > 2) %>%
+  filter(tissue == "leaf") %>%
+  select(GeneID) %>%
+  distinct(GeneID)
+
+#union between expressed genes, in total and for each tissue
+#21039 genes expressed
+union(lycoGenes$GeneID,pennGenes$GeneID)
+#7274 pollen genes expressed
+union(lycoPollenGenes$GeneID,pennPollenGenes$GeneID)
+#17829 style genes expressed
+union(lycoStyleGenes$GeneID,pennStyleGenes$GeneID)
+#18516 leaf genes expressed
+union(lycoLeafGenes$GeneID,pennLeafGenes$GeneID)
+#intersect between species, in total and for each tissue
+#18217 genes expressed in both species
+intersect(lycoGenes,pennGenes)
+#4899 pollen genes expressed in both species
+intersect(lycoPollenGenes,pennPollenGenes)
+#14686 style genes expressed in both species
+intersect(lycoStyleGenes,pennStyleGenes)
+#16145 leaf genes expressed in both species
+intersect(lycoLeafGenes,pennLeafGenes)
+
+intsectPollen<- intersect(lycoPollenGenes$GeneID,pennPollenGenes$GeneID)
+
+```
+
+#Most differentially expressed genes
+```{r}
+pvaluesDifExp<-lyc_vs_pen %>%
+  bind_cols(pollen_species) %>%
+  bind_cols(style_species) %>%
+  select(-baseMean...7) %>%
+  select(-baseMean...13) %>%
+  rename(baseMean=baseMean...1,
+         lyc_vs_pen_log2FoldChange=log2FoldChange...2,
+         lyc_vs_pen_lfcSE=lfcSE...3,
+         lyc_vs_pen_stat=stat...4,
+         lyc_vs_pen_pvalue=pvalue...5,
+         lyc_vs_pen_padj=padj...6,
+         pollen_species_log2FoldChange=log2FoldChange...8,
+         pollen_species_lfcSE=lfcSE...9,
+         pollen_species_stat=stat...10,
+         pollen_species_pvalue=pvalue...11,
+         pollen_species_padj=padj...12,
+         style_species_log2FoldChange=log2FoldChange...14,
+         style_species_lfcSE=lfcSE...15,
+         style_species_stat=stat...16,
+         style_species_pvalue=pvalue...17,
+         style_species_padj=padj...18)
+
+#making the pvalues the same size as the masterDF dataframe
+row.names(pvaluesDifExp)
+pvaluesDifExp$GeneID <- row.names(pvaluesDifExp)
+rownames(pvaluesDifExp) <- c(1:33562)
+extraSizedPvalues <- bind_rows(pvaluesDifExp,pvaluesDifExp, pvaluesDifExp,pvaluesDifExp,pvaluesDifExp, pvaluesDifExp)
+
+
+masterDFWithPvalues <- masterDF %>%
+  bind_cols(extraSizedPvalues)
+#checking to make sure the gene ids from each dataset are matching
+all(masterDFWithPvalues$GeneID...1==masterDFWithPvalues$GeneID...33)
+
+#removing the extra geneID column and renaming the first one
+masterDFWithPvaluesCln <- masterDFWithPvalues %>%
+  select(1:32) %>%
+  rename(GeneID = GeneID...1)
+#Saving
+write_csv(masterDFWithPvaluesCln, file='/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/masterDFWithPvaluesCln.txt')
+masterDFNew = data.frame(read.csv('/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/masterDFWithPvaluesCln.txt', sep = ',' ))
+view(masterDFNew)
+#checking top 10 differentialy expressed genes
+pollenBiasedPVal <- masterDFNew %>%
+  filter(GeneID %in% pollenBiasedGeneIDs) %>%
+  filter(tissue == "pollen")
+
+write_csv(pollenBiasedPVal, file = '/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/pollenBiasedPVal.txt')
+
+styleBiasedPVal <- masterDFNew %>%
+  filter(GeneID %in% styleBiasedGeneIDs) %>%
+  filter(tissue == 'styungerm')
+
+write_csv(styleBiasedPVal, file = '/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/styleBiasedPVal.txt')
+```
+
+#Making a new column detailing PMEs and PMEIs, or other, and making a graph based on it
+```{r}
+masterDF <- masterDF %>%
+  mutate(PMEPMEI = ifelse(PME == TRUE | PMEI == TRUE, ifelse(PME == TRUE, "PME", "PMEI"), "other"))
+
+masterDF %>%
+  unite('SpTis',species:tissue,remove = F) %>%
+  filter(!biased=='general') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  mutate(tissue = replace(tissue, tissue == "styungerm", "style")) %>%
+  mutate(species = replace(species, species == "lyc", "S. lycopersicum")) %>%
+  mutate(species = replace(species, species == "pen", "S. pennellii")) %>%
+  arrange(PMEPMEI) %>%
+  ggplot(aes(x=tau, y=log2Expression, color=PMEPMEI, shape=species)) +
+  geom_point(size=1.0) +
+  facet_wrap(~tissue) +
+  xlab("Tissue Bias") + 
+  ylab("Gene Expression (log base 2)") +
+  theme(legend.position = c(0.15, 0.85),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        axis.text = element_text(size = 8), 
+        axis.title = element_text(size = 8), 
+        panel.spacing = unit(0.7, "cm")) +
+  scale_color_manual(values = c("#aaaaaa28", "#311432","#ff6700")) +
+  scale_shape_manual(values = c(17,16)) +
+  theme_classic()
+```
+
+#Exporting PMEs and PMEIs with data
+```{r}
+PMEData <- masterDF %>%
+  filter(PME == T)
+PMEIData <- masterDF %>%
+  filter(PMEI == T)
+candidateGenes <- c(
+"Solyc05g052110.3",
+"Solyc05g052120.4",
+"Solyc05g054360.4",
+"Solyc06g009180.3",
+"Solyc07g017560.4",
+"Solyc12g099410.2",
+"Solyc03g112170.1")
+candidateGenesDF <- masterDF %>%
+  filter(GeneID %in% candidateGenes)
+
+reproductiveSpecificPMEs<-PMEData %>%
+  filter(GeneID %in% notInLeaf$GeneID) 
+
+write_csv(reproductiveSpecificPMEs, file = '/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/reproductiveSpecificPMEs.txt')
+
+reproductiveSpecificPMEIs <- PMEIData %>%
+  filter(GeneID %in% notInLeaf$GeneID)
+
+write_csv(reproductiveSpecificPMEIs, file = '/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/reproductiveSpecificPMEIs.txt')
+
+```
+
+#Dissertation Figures
+
+```{r}
+masterDF %>%
+  unite('SpTis',species:tissue,remove = F) %>%
+  filter(!biased=='general') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  mutate(tissue = replace(tissue, tissue == "styungerm", "style")) %>%
+  mutate(species = replace(species, species == "lyc", "S. lycopersicum")) %>%
+  mutate(species = replace(species, species == "pen", "S. pennellii")) %>%
+  ggplot(aes(x=tau, y=log2Expression, color=species, shape=species)) +
+  geom_point(size=3.0) +
+  facet_wrap(~tissue) +
+  xlab("Tissue Bias") + 
+  ylab("Gene Expression (log base 2)") +
+  theme(legend.position = c(0.15, 0.9),
+        legend.text = element_text(size = 25), 
+        legend.title = element_text(size = 27), 
+        strip.text = element_text(size = 25), 
+        axis.text = element_text(size = 25), 
+        axis.title = element_text(size = 27), 
+        panel.spacing = unit(0.7, "cm")) +
+  scale_color_manual(values = c("#311432","#ff6700")) +
+  scale_shape_manual(values = c(17,16))
+
+
+masterDF %>%
+  filter(PMEPMEI != "other")  %>%
+  filter(GeneID %in% notInLeaf$GeneID)  %>%
+  filter(tissue != 'leaf') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log2Expression,
+             ymax=log2Expression+Error,
+             ymin=log2Expression-Error)) +
+  geom_errorbar(width=0.1, aes(colour = PMEPMEI)) +
+  geom_point(aes(shape = PMEPMEI,colour = PMEPMEI),size = 2) + #, 
+  geom_line(aes(colour=PMEPMEI,group=GeneIDTis, linetype = PMEPMEI), size = 0.3) + #colour=PMEPMEI,
+  #theme() +
+  scale_x_discrete(labels=c("pen_pollen" = "SP pollen",
+                            "lyc_pollen" = "SL pollen", 
+                            "pen_styungerm" = "SP style", 
+                            "lyc_styungerm" = "SP style")) +
+  scale_y_continuous(limits = c(0, NA)) + 
+  labs(#title = 'Reproductive Tissue PMEs & PMEIs',
+       x='Species & Tissue',
+       y='Gene Expression (log base 2 TPM)',
+       color = "Gene Category") + 
+  theme_classic() +
+  theme(axis.text = element_text(size = 8), 
+        axis.title = element_text(size = 8),
+        #title = element_text(size = 12),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = c(0.8, 0.8))+
+  scale_color_manual(name = "Gene Category",values = c("#800000","#3cb44b")) +
+  scale_shape_manual(name = "Gene Category", values = c(16,17))
+
+#colorless
+masterDF %>%
+  filter(PMEPMEI != "other")  %>%
+  filter(GeneID %in% notInLeaf$GeneID)  %>%
+  filter(tissue != 'leaf') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(aes(shape = PMEPMEI),size = 2) + #, 
+  geom_line(aes(group=GeneIDTis, linetype = PMEPMEI), size = 0.3) + #colour=PMEPMEI,
+  #theme() +
+  scale_x_discrete(labels=c("pen_pollen" = "SP pollen",
+                            "lyc_pollen" = "SL pollen", 
+                            "pen_styungerm" = "SP style", 
+                            "lyc_styungerm" = "SP style")) +
+  scale_y_continuous(limits = c(0, NA)) + 
+  labs(#title = 'Reproductive Tissue PMEs & PMEIs',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)',
+       color = "Gene Category") + 
+  theme_classic() +
+  theme(axis.text = element_text(size = 8), 
+        axis.title = element_text(size = 8),
+        #title = element_text(size = 12),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = c(0.8, 0.8)) +
+  scale_shape_manual(name = "Gene Category", values = c(22,24)) +
+  scale_linetype_manual(name = "Gene Category", values = c("longdash", "dotted"))
+
+
+
+masterDF$PMEPMEI<- factor(masterDF$PMEPMEI, levels=c('other','PME', 'PMEI'))
+
+masterDF %>%
+  unite('SpTis',species:tissue,remove = F) %>%
+  filter(!biased=='general') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  mutate(tissue = replace(tissue, tissue == "styungerm", "style")) %>%
+  mutate(species = replace(species, species == "lyc", "SL")) %>%
+  mutate(species = replace(species, species == "pen", "SP")) %>%
+  arrange(PMEPMEI) %>%
+  ggplot(aes(x=tau, y=log2Expression, color=species, shape=PMEPMEI)) +
+  geom_point(size=1.3) +
+  facet_wrap(~tissue) +
+  xlab("Tissue Bias") + 
+  ylab("Gene Expression (log base 2 TPM)") +
+  theme_classic() +
+  theme(#legend.position = c(0.06, 0.75),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        axis.text = element_text(size = 8), 
+        axis.title = element_text(size = 8), 
+        panel.spacing = unit(0.15, "cm")) +
+  scale_color_manual(name = "Gene Category",values = c("#800000","#3cb44b")) +
+  scale_shape_manual(name = "Gene Category", values = c(15,16,17))
+
+masterDF %>%
+  unite('SpTis',species:tissue,remove = F) %>%
+  filter(!biased=='general') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  mutate(tissue = replace(tissue, tissue == "styungerm", "style")) %>%
+  mutate(species = replace(species, species == "lyc", "SL")) %>%
+  mutate(species = replace(species, species == "pen", "SP")) %>%
+  arrange(PMEPMEI) %>%
+  ggplot(aes(x=tau, y=log2Expression, color=PMEPMEI, shape=PMEPMEI)) +
+  geom_point(size=1.3) +
+  facet_wrap(~tissue) +
+  xlab("Tissue Bias") + 
+  ylab("Gene Expression (log base 2 TPM)") +
+  theme_classic() +
+  theme(#legend.position = c(0.06, 0.75),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        axis.text = element_text(size = 8), 
+        axis.title = element_text(size = 8), 
+        panel.spacing = unit(0.15, "cm")) +
+  scale_color_manual(name = "Gene Category",values = c("#aaaaaa12","#800000","#3cb44b")) +
+  scale_shape_manual(name = "Gene Category", values = c(15,16,17))
+
+masterDF %>%
+  unite('SpTis',species:tissue,remove = F) %>%
+  mutate(species = replace(species, species == "lyc", "SL")) %>%
+  mutate(species = replace(species, species == "pen", "SP")) %>%
+  unite('SpPMEPMEI', c(species, PMEPMEI), remove = F) %>%
+  filter(!biased=='general') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  mutate(tissue = replace(tissue, tissue == "styungerm", "style")) %>%
+  arrange(PMEPMEI) %>%
+  ggplot(aes(x=tau, y=log10Expression, color=SpPMEPMEI, shape=SpPMEPMEI)) +
+  geom_point(size=1.3) +
+  facet_wrap(~tissue) +
+  xlab("Tissue Bias") + 
+  ylab("Gene Expression (log base 10 TPM)") +
+  theme_classic() +
+  theme(#legend.position = c(0.06, 0.75),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        axis.text = element_text(size = 8), 
+        axis.title = element_text(size = 8), 
+        panel.spacing = unit(0.2, "cm")) +
+  scale_color_manual(name = "Gene Category", values = c("#aaaaaa12","#ff6700","#ff6700", "#aaaaaa12","#000075","#000075")) +
+  scale_shape_manual(name = "Gene Category", values = c(21, 22, 24, 21, 22,24))
+
+#values = c(1, 22,24, 1, 22,24)
+
+#scale_color_manual(labels = c("SP", "SL"), values = c("#000075","#ff6700"))
+masterDF %>%
+  unite('SpTis',species:tissue,remove = F) %>%
+  filter(!biased=='general') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  mutate(tissue = replace(tissue, tissue == "styungerm", "style")) %>%
+  mutate(species = replace(species, species == "lyc", "SL")) %>%
+  mutate(species = replace(species, species == "pen", "SP")) %>%
+  arrange(PMEPMEI) %>%
+  ggplot(aes(x=tau, y=log2Expression, color=PMEPMEI, shape=species)) +
+  geom_point(size=1.3) +
+  facet_wrap(~tissue) +
+  xlab("Tissue Bias") + 
+  ylab("Gene Expression (log base 2 TPM)") +
+  theme_classic() +
+  theme(#legend.position = c(0.06, 0.75),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        axis.text = element_text(size = 8), 
+        axis.title = element_text(size = 8), 
+        panel.spacing = unit(0.15, "cm")) +
+  scale_color_manual(values = c("#aaaaaa12","#800000","#3cb44b")) +
+  scale_shape_manual(values = c(17,16)) +
+  labs(shape = "Species",color = "Gene Category")
+
+masterDF %>%
+  unite('SpTis',species:tissue,remove = F) %>%
+  filter(!biased=='general') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  mutate(tissue = replace(tissue, tissue == "styungerm", "style")) %>%
+  mutate(species = replace(species, species == "lyc", "SL")) %>%
+  mutate(species = replace(species, species == "pen", "SP")) %>%
+  arrange(PMEPMEI) %>%
+  ggplot(aes(x=tau, y=log10Expression, color=species)) +
+  geom_point(size=.3) +
+  facet_wrap(~tissue) +
+  xlab("Tissue Bias") + 
+  ylab("Gene Expression (log base 10 TPM)") +
+  theme_classic() +
+  theme(#legend.position = c(0.06, 0.75),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        axis.text = element_text(size = 8), 
+        axis.title = element_text(size = 8), 
+        panel.spacing = unit(0.15, "cm")) +
+  scale_color_manual(values = c("#000075",)) +
+  #scale_shape_manual(values = c(17,16)) +
+  labs(color = "Species" ) #shape = "Species",
+```
+
+#Analyzing in-vitro pollen tube growth data from pen and lyco
+```{r}
+pollenDataLycoPenn <- data.frame(read.csv('/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/LycoPennPollenTubeGrowthAssay.csv', header=T, row.names = NULL))
+
+pollenDataLycoPenn$AccessionNum <- as.character(pollenDataLycoPenn$AccessionNum)
+pollenDataLycoPenn$IndividualNum <- as.character(pollenDataLycoPenn$IndividualNum)
+pollenDataLycoPenn$ImageUsed <- as.character(pollenDataLycoPenn$ImageUsed)
+pollenDataLycoPenn$UnhealthyPollenScore <- as.numeric(pollenDataLycoPenn$UnhealthyPollenScore)
+pollenDataLycoPenn$NumHealthyPollen <- as.numeric(pollenDataLycoPenn$NumHealthyPollen)
+pollenDataLycoPenn$NumGerminated <- as.numeric(pollenDataLycoPenn$NumGerminated)
+pollenDataLycoPenn$NumBurstPollenTubes <- as.numeric(pollenDataLycoPenn$NumBurstPollenTubes)
+
+pollenLycoPennMDFAverages <- pollenDataLycoPenn %>%
+  drop_na() %>%
+  unite("TestSpInd", c(Test, AccessionNum, IndividualNum), remove = F) %>%
+  dplyr::group_by(TestSpInd) %>%
+  dplyr::select(-PollenSampleGridNumber) %>%
+  dplyr::mutate(PollenDiameterMean = mean(umPollenDiameter)) %>%
+  dplyr::mutate(PollenDiameterStdDev = sqrt(var(umPollenDiameter))) %>%
+  dplyr::mutate(PollenTubeLengthMean = mean(umPollenTubeLength)) %>%
+  dplyr::mutate(PollenTubeLengthStdDev = sqrt(var(umPollenTubeLength))) %>%
+  dplyr::group_by(TestSpInd) %>%
+  dplyr::select(-c(umPollenDiameter, umPollenTubeLength)) %>%
+  distinct() %>%
+  unite("TestInd", c(Test,IndividualNum), remove = F) %>%
+  dplyr::mutate(ProportionGerminated = NumGerminated/NumHealthyPollen) %>%
+  dplyr::mutate(ProportionBurst = NumBurstPollenTubes/NumGerminated) %>%
+  unite("SpInd", c(AccessionNum, IndividualNum), remove = F) %>%
+  ungroup() %>% #Everything after this is to average across technical replicates
+  group_by(SpInd) %>%
+  mutate(PollenDiameterMeanTest = mean(PollenDiameterMean)) %>%
+  mutate(PollenTubeLengthMeanTest = mean(PollenTubeLengthMean)) %>%
+  mutate(ProportionBurstMean = mean(ProportionBurst)) %>%
+  mutate(ProportionGerminatedMean = mean(ProportionGerminated)) %>%
+  mutate(NumHealthyPollenMean = mean(NumHealthyPollen)) %>%
+  mutate(UnhealthyPollenScoreMean = mean(UnhealthyPollenScore)) %>%
+  dplyr::select(-c(PollenDiameterMean,PollenTubeLengthMean,ProportionBurst,ProportionGerminated,Plate.Location, ImageUsed,NumHealthyPollen, NumGerminated, NumBurstPollenTubes, UnhealthyPollenScore, Test,TestInd, TestSpInd)) %>%
+  distinct() %>%
+  ungroup()
+
+noTechRepsLycoPenn <- pollenLycoPennMDFAverages %>%
+  dplyr::select(-c(PollenDiameterStdDev, PollenTubeLengthStdDev)) %>%
+  distinct()
+
+pollenMDFLycoPenn <- pollenDataLycoPenn %>%
+  drop_na() %>%
+  unite("TestSpInd", c(Test, AccessionNum, IndividualNum), remove = F) %>%
+  dplyr::group_by(TestSpInd) %>%
+  dplyr::select(-PollenSampleGridNumber) %>%
+  dplyr::mutate(PollenDiameterMean = mean(umPollenDiameter)) %>%
+  dplyr::mutate(PollenDiameterStdDev = sqrt(var(umPollenDiameter))) %>%
+  dplyr::mutate(PollenTubeLengthMean = mean(umPollenTubeLength)) %>%
+  dplyr::mutate(PollenTubeLengthStdDev = sqrt(var(umPollenTubeLength))) %>%
+  dplyr::group_by(TestSpInd) %>%
+  dplyr::select(-c(umPollenDiameter, umPollenTubeLength)) %>%
+  distinct() %>%
+  unite("TestInd", c(Test,IndividualNum), remove = F) %>%
+  dplyr::mutate(ProportionGerminated = NumGerminated/NumHealthyPollen) %>%
+  dplyr::mutate(ProportionBurst = NumBurstPollenTubes/NumGerminated) %>%
+  unite("SpInd", c(AccessionNum, IndividualNum), remove = F) %>%
+  ungroup()
+
+pollenMDFLycoPenn <- pollenMDFLycoPenn %>%
+  dplyr::mutate(PollenTubeRateMean = PollenTubeLengthMean/3, PollenTubeRateStdDev = PollenTubeLengthStdDev/3)
+
+pollenMDFLycoPenn %>%
+  ggplot(aes(y = PollenDiameterMean, x = AccessionNum)) +
+  geom_boxplot() +
+  geom_dotplot(binaxis = "y",stackdir = "center",dotsize = 0.3) +
+  labs(x = "Species", y = "Pollen Diameter (ums)", color = "Species")
+
+pollenLycoPennMDFAverages %>%
+  ggplot(aes(y = PollenDiameterMeanTest, x = AccessionNum)) +
+  geom_boxplot() +
+  geom_dotplot(binaxis = "y",stackdir = "center",dotsize = 0.3) +
+  labs(x = "Species", y = "Pollen Diameter (ums)", color = "Species")
+  
+pollenMDFLycoPenn %>%
+  ggplot(aes(y = PollenDiameterMean, x = SpInd)) +
+  geom_point(aes(color=AccessionNum), size = 1) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black") +
+  stat_summary(aes(y = PollenDiameterMean, x = AccessionNum),
+               fun = mean, geom = "crossbar", color = "blue", linewidth = 0.3, position = position_nudge(x=3)) +
+  labs(x = "Species and Individuals", y = "Pollen Diameter (ums)", color = "Species") +
+  theme(legend.position = c(0.1, 0.14),
+        legend.text = element_text(size = 12), 
+        legend.title = element_text(size = 12), 
+        strip.text = element_text(size = 12), 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(), 
+        panel.spacing = unit(0.1, "cm"))
+
+pollenMDFLycoPenn %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "M82", "S. lycopersicum")) %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "716", "S. pennellii")) %>%
+  ggplot(aes(y = PollenTubeRateMean, x = SpInd)) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black") +
+  stat_summary(aes(y = PollenTubeRateMean, x = AccessionNum),
+               fun = mean, geom = "crossbar", color = "blue", size = 0.3, position = position_nudge(x=3)) +
+  geom_point(aes(color=AccessionNum), size = 1) +
+  labs(x = "Species and Individuals", y = "Pollen Tube Growth Rate (ums/hour)", color = "Species") +
+  theme_classic() +
+  theme(legend.position = c(0.2, 0.85), 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(), 
+        panel.spacing = unit(0.1, "cm")) +
+  scale_color_manual(labels = c("S. pennellii", "S. lycopersicum"), values = c("#000075","#ff6700")) +
+  scale_shape_manual(values = c(17,16))
+
+pollenMDFLycoPenn %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "M82", "S. lycopersicum")) %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "716", "S. pennellii")) %>%
+  ggplot(aes(y = PollenTubeRateMean, x = AccessionNum)) +
+  geom_boxplot(size = 0.5, outlier.size = 0.1) +
+  geom_dotplot(aes(fill = AccessionNum), dotsize = 0.5, binaxis = "y", stackdir = "center") +
+  #stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black") +
+  #stat_summary(aes(y = PollenTubeLengthMean, x = AccessionNum),
+  #             fun = mean, geom = "crossbar", color = "blue", size = 0.3, position = position_nudge(x=3)) +
+  labs(x = "Species", y = "Pollen Tube Growth Rate (ums/hour)", color = "Species") +
+  theme_classic() +
+  theme(legend.position = c(0.2, 0.85),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(), 
+        panel.spacing = unit(0.1, "cm"))
+
+#This graph is the same as the one above, but with the individuals labeled
+pollenMDFLycoPenn %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "M82", "S. lycopersicum")) %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "716", "S. pennellii")) %>%
+  ggplot(aes(y = PollenTubeRateMean, x = SpInd)) +
+  geom_boxplot(size = 0.5, outlier.size = 0.1) +
+  geom_dotplot(aes(fill = AccessionNum), dotsize = 0.5, binaxis = "y", stackdir = "center") +
+  #stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black") +
+  #stat_summary(aes(y = PollenTubeLengthMean, x = AccessionNum),
+  #             fun = mean, geom = "crossbar", color = "blue", size = 0.3, position = position_nudge(x=3)) +
+  labs(x = "Species and Individuals", y = "Pollen Tube Growth Rate (ums/hour)", color = "Species") +
+  theme_classic() +
+  theme(legend.position = c(0.2, 0.85),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        panel.spacing = unit(0.1, "cm"))
+  
+#This graph is for pollen diameter
+pollenMDFLycoPenn %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "M82", "S. lycopersicum")) %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "716", "S. pennellii")) %>%
+  ggplot(aes(y = PollenDiameterMean, x = AccessionNum)) +
+  geom_boxplot(size = 0.5, outlier.size = 0.1) +
+  geom_dotplot(aes(fill = AccessionNum), dotsize = 0.5, binaxis = "y", stackdir = "center") +
+  #stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black") +
+  #stat_summary(aes(y = PollenTubeLengthMean, x = AccessionNum),
+  #             fun = mean, geom = "crossbar", color = "blue", size = 0.3, position = position_nudge(x=3)) +
+  labs(x = "Species and Individuals", y = "Pollen Diameter (ums)", color = "Species") +
+  theme_classic() +
+  theme( strip.text = element_text(size = 8), 
+        #axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(), 
+        panel.spacing = unit(0.1, "cm"),
+        legend.position = "none") #+
+  #scale_y_continuous(limits = c(0,1000))
+  scale_color_manual(labels = c("S. pennellii", "S. lycopersicum"), values = c("#ff6700","#311432")) +
+  scale_shape_manual(values = c(17,16))
+
+#This graph is for pollen tube length, but without color for species
+pollenMDFLycoPenn %>%
+  unite("SpInd", c(AccessionNum, IndividualNum)) %>%
+  ggplot(aes(y=PollenTubeLengthMean, x=SpInd)) +
+  geom_boxplot() +
+  geom_dotplot(binaxis = "y",stackdir = "center",dotsize = 0.3)
+
+
+#This graph plots pollen diameter by pollen tube length
+pollenMDFLycoPenn %>%
+  ggplot(aes(PollenTubeLengthMean, PollenDiameterMean, color = AccessionNum)) +
+  geom_point(size = 2) +
+  geom_smooth()
+  #geom_density2d() +
+  #geom_smooth()
+
+#Statistical analysis
+#significant differences between species and individuals (species:p = 1.18e-12, individuals: p = 4.05e-07 ***)
+aNOVA1 <- aov(pollenMDFLycoPenn$PollenTubeLengthMean~pollenMDFLycoPenn$AccessionNum/factor(pollenMDFLycoPenn$SpInd)) #
+summary(aNOVA1)
+
+# Get the summary of the ANOVA model
+summary_aNOVA1 <- summary(aNOVA1)
+
+# Convert the summary to a data frame
+summary_aNOVA1_df <- data.frame(summary_aNOVA1[[1]])
+
+# Write the summary to a CSV file
+write.csv(summary_aNOVA1_df, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/InVitroGrowthWIndividuals.csv")
+
+aNOVA1b <- aov(PollenTubeRateMean~AccessionNum/factor(SpInd) +Plate.Location + NumHealthyPollen + UnhealthyPollenScore + ProportionGerminated + ProportionBurst + Test, data = pollenMDFLycoPenn)
+summary(aNOVA1b)
+#lycopersicum and pennellii are their own groups
+HSD1 <- HSD.test(aNOVA1, "pollenMDFLycoPenn$AccessionNum")
+HSD1
+
+TukeyHSD(aNOVA1b, "AccessionNum")
+TukeyHSD(aNOVA1b, "NumHealthyPollen")
+
+  
+ANOVA2 <- aov(pollenMDFLycoPenn$PollenTubeLengthMean~pollenMDFLycoPenn$SpInd)
+summary(ANOVA2)
+
+HSD2 <- HSD.test(ANOVA2, "pollenMDFLycoPenn$SpInd")
+HSD2
+
+#Significant differences within species between individuals i think
+ANOVAWSPTGR <- aov(PollenTubeLengthMean ~ AccessionNum + IndividualNum %in% AccessionNum, data = pollenMDFLycoPenn)
+
+summary(ANOVAWSPTGR)
+
+HSDWSPTGR <- HSD.test(ANOVAWSPTGR, "pollenMDFLycoPenn$SpInd")
+HSDWSPTGR
+
+#significant differences between species, but not between individuals
+ANOVA3 <- aov(pollenMDFLycoPenn$PollenDiameterMean~pollenMDFLycoPenn$AccessionNum/factor(pollenMDFLycoPenn$SpInd)) #
+summary(ANOVA3)
+
+summary_aNOVA3 <- summary(ANOVA3)
+
+# Convert the summary to a data frame
+summary_aNOVA3_df <- data.frame(summary_aNOVA3[[1]])
+
+# Write the summary to a CSV file
+write.csv(summary_aNOVA3_df, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/InVitroDiamterWIndividuals.csv")
+
+
+ANOVAWSPTD <- aov(PollenDiameterMean ~ AccessionNum + IndividualNum %in% AccessionNum, data = pollenMDFLycoPenn)
+
+summary(ANOVAWSPTD)
+
+aNOVA3b <- aov(PollenDiameterMean~AccessionNum/factor(SpInd) +Plate.Location + NumHealthyPollen + NumGerminated + NumBurstPollenTubes + UnhealthyPollenScore + ProportionGerminated + ProportionBurst + PollenTubeRateMean, data = pollenMDFLycoPenn)
+summary(aNOVA3b)
+
+#every species is grouped independently
+HSD3 <- HSD.test(ANOVA3, "pollenMDFLycoPenn$AccessionNum")
+HSD3
+
+HSD3 <- HSD.test(ANOVA3, "pollenMDFLycoPenn$SpInd")
+HSD3
+
+
+lmPollenDiameterXPollenTubeLength <- lm(PollenDiameterMean~PollenTubeLengthMean/factor(pollenMDFLycoPenn$AccessionNum), data = pollenMDFLycoPenn)
+summary(lmPollenDiameterXPollenTubeLength)
+
+lmPollenTubeLengthXPollenDiameter <- lm(PollenTubeLengthMean~PollenDiameterMean, data = pollenMDFLycoPenn)
+summary(lmPollenTubeLengthXPollenDiameter)
+
+
+#testing if variance is different b/w species
+PTGRVT <- var.test(PollenTubeLengthMean ~ AccessionNum, pollenMDFLycoPenn, alternative = "two.sided")
+
+#significant differences in variance between species, p = 0.0001331
+PTGRVT
+
+pollenMDFPenn <- pollenMDFLycoPenn %>%
+  filter(AccessionNum == "716")
+  
+pollenMDFLyco <- pollenMDFLycoPenn %>%
+  filter(AccessionNum == "M82")
+
+
+#Pennellii has much lower variance than lycopersicum
+var(pollenMDFLycoPenn$PollenTubeLengthMean)*(50-1)/50
+
+var(pollenMDFLyco$PollenTubeLengthMean)*(25-1)/25
+
+var(pollenMDFPenn$PollenTubeLengthMean)*(25-1)/25
+```
+
+#Determining which pollen biased PMEs and PMEIs 
+```{r}
+###Reading in SolGenomics ITAG4.0 Protein Sequence
+ITAG40ProteinFASTA<-seqinr::read.fasta(file = "/Users/tbiewerh/Desktop/OvuleDifferentialGeneExpressionExp/AreYouFASTAnough/ITAG4.0_proteins.fasta", seqtype = "AA",as.string = T)
+names(ITAG40ProteinFASTA)
+
+ITAG <- as.data.frame(do.call(rbind, ITAG40ProteinFASTA))
+
+ITAG2 <- tibble::rownames_to_column(ITAG, var = "name")
+
+#need gene ids to be 16 characters long at most
+ITAG2$name <- substr(ITAG2$name, 1, 14)
+
+reproductivePMEs_PMEIs <- masterDF %>%
+  dplyr::filter(PME == TRUE | PMEI == TRUE) %>%
+  dplyr::filter(!biased =="general") %>%
+  dplyr::filter(!biased == "leaf")
+
+reproductivePMEs <- masterDF %>%
+  dplyr::filter(PME == TRUE) %>%
+  dplyr::filter(!biased =="general") %>%
+  dplyr::filter(!biased == "leaf")
+
+reproductivePMEIs <- masterDF %>%
+  dplyr::filter(PMEI ==TRUE) %>%
+  dplyr::filter(!biased =="general") %>%
+  dplyr::filter(!biased == "leaf")
+
+masterDF$GeneID <- substr(masterDF$GeneID,1,14)
+reproductivePMEs_PMEIsFull <- masterDF %>%
+  filter(GeneID %in% reproductivePMEs_PMEIs$GeneID)
+
+reproductivePMEs_PMEIs$GeneID <- substr(reproductivePMEs_PMEIs$GeneID, 1, 14)
+
+PMEs_PMEIsProteinSequences <- ITAG2 %>%
+  filter(name %in% reproductivePMEs_PMEIs$GeneID) %>%
+  dplyr::arrange(name) %>%
+  dplyr::mutate(V1 = gsub("[*]", "", V1))
+
+PMEs_ProteinSequence <- ITAG2 %>%
+  filter(name %in% reproductivePMEs$GeneID) %>%
+  dplyr::arrange(name) %>%
+  dplyr::mutate(V1 = gsub("[*]", "", V1))
+
+PMEIs_ProteinSequence <- ITAG2 %>%
+  filter(name %in% reproductivePMEIs$GeneID) %>%
+  dplyr::arrange(name) %>%
+  dplyr::mutate(V1 = gsub("[*]", "", V1))
+
+PMEs_SP_ProteinSequence <- ITAG2 %>%
+  filter(name %in% repSpecificSPPMEs$GeneID) %>%
+  dplyr::arrange(name) %>%
+  dplyr::mutate(V1 = gsub("[*]", "", V1))
+
+library(stringr)
+library(seqinr)
+
+writeFasta<-function(data, filename){
+  fastaLines = c()
+  for (rowNum in 1:nrow(data)){
+    fastaLines = c(fastaLines, as.character(paste(">", data[rowNum,"name"], sep = "")))
+    fastaLines = c(fastaLines,as.character(data[rowNum,"V1"]))
+  }
+  fileConn<-file(filename)
+  writeLines(fastaLines, fileConn)
+  close(fileConn)
+}
+
+writeFasta(PMEs_PMEIsProteinSequences, "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/PMEs_PMEIsProteinSequences")
+
+writeFasta(PMEs_ProteinSequence, "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/PMEs_ProteinSequences")
+
+writeFasta(PMEIs_ProteinSequence, "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/PMEIs_ProteinSequences")
+
+writeFasta(PMEs_SP_ProteinSequence, "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/PMEs_SP_ProteinSequences")
+
+
+ReproductivePMEs_PMEIs_Signal_Status <- read.delim('/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/PMEs_PMEIsSignalPResults/prediction_results.txt', sep = "\t", header = T) %>%
+  rename(GeneID = ID)
+
+rep_PMEsPMEIs_masterDF <- reproductivePMEs_PMEIsFull %>%
+  left_join(ReproductivePMEs_PMEIs_Signal_Status, by = 'GeneID')
+
+notInLeaf$GeneID <- substr(notInLeaf$GeneID, 1, 14)
+
+repSpecificSPPMEs <- rep_PMEsPMEIs_masterDF %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(PME == TRUE) %>%
+  filter(Prediction == "SP") %>%
+  arrange(GeneID)
+
+repSpecificSPPMEIs <- rep_PMEsPMEIs_masterDF %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(PMEI == TRUE) %>%
+  filter(Prediction == "SP") %>%
+  arrange(GeneID)
+
+rep_PMEsPMEIs_masterDF %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(PME == TRUE) %>%
+  filter(tissue != 'leaf') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 2) +
+  geom_line(aes(colour=Prediction, group = GeneIDTis), size = 1) +
+  scale_x_discrete(labels=c("pen_pollen" = "SP pollen",
+                            "lyc_pollen" = "SL pollen", 
+                            "pen_styungerm" = "SP style", 
+                            "lyc_styungerm" = "SL style")) +
+  labs(title = 'Reproductive Tissue PMEs by Signal Peptide Presence',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)',
+       color = "Signal Status")
+
+rep_PMEsPMEIs_masterDF %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(PMEI == TRUE) %>%
+  filter(tissue != 'leaf') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 2) +
+  geom_line(aes(colour=Prediction, group = GeneIDTis), size = 1) +
+  scale_x_discrete(labels=c("pen_pollen" = "SP pollen",
+                            "lyc_pollen" = "SL pollen", 
+                            "pen_styungerm" = "SP style", 
+                            "lyc_styungerm" = "SL style")) +
+  labs(title = 'Reproductive Tissue PMEIs by Signal Peptide Presence',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)',
+       color = "Signal Status")
+
+masterDF %>%
+  filter(PMEPMEI != "other")  %>%
+  filter(GeneID %in% notInLeaf$GeneID)  %>%
+  filter(tissue != 'leaf') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 2) +
+  geom_line(aes(colour=PMEPMEI,group=GeneIDTis), size = 1) +
+  theme(legend.position = c(0.87, 0.92)) +
+  scale_x_discrete(labels=c("pen_pollen" = "SP pollen",
+                            "lyc_pollen" = "SL pollen", 
+                            "pen_styungerm" = "SP style", 
+                            "lyc_styungerm" = "SL style")) +
+  labs(title = 'Reproductive Tissue PMEs & PMEIs',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)',
+       color = "Gene Family") + 
+  theme(axis.text = element_text(size =12), 
+        axis.title = element_text(size = 12),
+        title = element_text(size = 12),
+        axis.text.x = element_text(angle = 12, hjust = 1))+
+  scale_color_manual(values = c("#311432","#ff6700"))
+```
+
+#InPlanta Pollen Tube Growth
+```{r}
+InVivoPollenTubeGrowth <- data.frame(read.csv('/Users/tbiewerh/Desktop/LycoPennPollenTubeGrowthAssay/InplantaPollenTubeGrowth.csv', header=T, row.names = NULL))
+
+
+detach(package:plyr)
+InVivoPollenTubeGrowthMeans <- InVivoPollenTubeGrowth %>%
+  #select(Date) %>%
+  separate(Date, into = c("Month", "Day", "Year"), sep = "_") %>%
+  mutate(Year = 2023) %>%
+  unite("Date", c(Year, Month, Day), sep = "-") %>%
+  unite("DateSpCrossStyle", c(Date, Species, PollenRecipient, PollenDonor,Style), remove = F) %>%
+  group_by(DateSpCrossStyle) %>%
+  dplyr::mutate(PollenTubeLengthMean = mean(PollenTubeLength_um)) %>%
+  dplyr::mutate(PollenTubeLengthStdDev = sqrt(var(PollenTubeLength_um))) %>%
+  select(-c(PollenTubeLength_um)) %>%
+  unite("SpCr", c(Species, PollenRecipient, PollenDonor), remove = F) %>%
+  unite("SpPolAmnt", c(Species, LowPollen), remove = F) %>%
+  distinct() %>%
+  ungroup()
+
+InVivoPollenTubeGrowthMeans$startTimeMinutes = str_sub(InVivoPollenTubeGrowthMeans$StartTime, nchar(InVivoPollenTubeGrowthMeans$StartTime) - 1, nchar(InVivoPollenTubeGrowthMeans$StartTime))
+
+InVivoPollenTubeGrowthMeans$startTimeHours = str_sub(InVivoPollenTubeGrowthMeans$StartTime, 1, nchar(InVivoPollenTubeGrowthMeans$StartTime) - 2)
+
+InVivoPollenTubeGrowthMeans$endTimeMinutes = str_sub(InVivoPollenTubeGrowthMeans$EndTime, nchar(InVivoPollenTubeGrowthMeans$EndTime) - 1, nchar(InVivoPollenTubeGrowthMeans$EndTime))
+
+InVivoPollenTubeGrowthMeans$endTimeHours = str_sub(InVivoPollenTubeGrowthMeans$EndTime, 1, nchar(InVivoPollenTubeGrowthMeans$EndTime) - 2)
+
+InVivoPollenTubeGrowthMeansTime <- InVivoPollenTubeGrowthMeans %>%
+  dplyr::mutate(startTime = (as.numeric(startTimeHours) * 60) + as.numeric(startTimeMinutes)) %>%
+  dplyr::mutate(endTime = (as.numeric(endTimeHours) * 60) + as.numeric(endTimeMinutes)) %>%
+  dplyr::mutate(Time = (endTime - startTime)/60) %>%
+  select(-c(StartTime,EndTime,startTime,endTime,startTimeMinutes,startTimeHours, endTimeMinutes, endTimeHours)) %>%
+  dplyr::mutate(pollenTubeLengthMeansPerHour = PollenTubeLengthMean/Time) %>%
+  dplyr::mutate(pollenTubeLengthMeansPerHourStDev = PollenTubeLengthStdDev/Time) %>%
+  dplyr::mutate(ProportionStyleTraveled = PollenTubeLengthMean/StyleLength_um) %>%
+  unite("SpPollenRecipient", c(Species, PollenRecipient), remove = F) %>%
+  unite("SpPollenDonor", c(Species, PollenDonor), remove = F) 
+
+  
+InVivoPollenTubeGrowthMeans %>%
+  ggplot(aes(x = SpCr, y = PollenTubeLengthMean)) +
+  geom_point(aes(color=SpPolAmnt)) #+
+  #theme(axis.text.x=element_blank(),
+  #      axis.ticks.x=element_blank())
+  
+#InVivoPollenTubeGrowthPlot
+InVivoPollenTubeGrowthMeansTime %>%
+  ggplot(aes(x = SpCr, y = pollenTubeLengthMeansPerHour)) +
+  geom_point(aes(color=SpPolAmnt), size = 6) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 1) +
+  stat_summary(aes(y = pollenTubeLengthMeansPerHour, x = Species),
+               fun = mean, geom = "crossbar", color = "blue", size = 1.5, position = position_nudge(x=8)) +
+   labs(title = 'In-Vivo Pollen Tube Growth Rate Per Hour',
+       x='Pollen Cross',
+       y='Pollen Tube Growth Rate (um/hour)',
+       color = "Species and Mark for Low Pollen") +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(), 
+        axis.title = element_text(size = 40),
+        legend.text = element_text(size = 36), 
+        legend.title = element_text(size = 40), 
+        strip.text = element_text(size = 36), 
+        axis.text = element_text(size = 36),
+        title = element_text(size = 45))
+ 
+InVivoPollenTubeGrowthMeansTime %>%
+  filter(LowPollen == F) %>%
+  ggplot(aes(x = SpPollenDonor, y = pollenTubeLengthMeansPerHour)) +
+  stat_summary(aes(y = pollenTubeLengthMeansPerHour, x = Species),
+               fun = mean, geom = "crossbar", color = "blue", size = 0.4, position = position_nudge(x=3), width = 4.8) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 0.3) +
+  geom_point(aes(color=Species), size = 1) +
+  ylim(0,1000) +
+   labs(#title = 'In-Vivo Pollen Tube Growth Rate Per Hour without Low Pollen Samples',
+       x='Pollen Donor',
+       y='Pollen Tube Growth Rate (ums/hour)',
+       color = "Species") +
+  theme_classic() +
+  theme(legend.position = c(0.9, 0.85),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+        #axis.title = element_text(size = 40),
+        #legend.text = element_text(size = 36), 
+        #legend.title = element_text(size = 40), 
+        #strip.text = element_text(size = 36), 
+        #axis.text = element_text(size = 36),
+        #title = element_text(size = 45)) +
+  scale_color_manual(labels = c("SP", "SL"), values = c("#000075","#ff6700")) +
+  guides(color = guide_legend(override.aes = list(size = 2)))
+
+
+pollenMDFLycoPenn %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "M82", "S. lycopersicum")) %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "716", "S. pennellii")) %>%
+  ggplot(aes(y = PollenTubeRateMean, x = SpInd)) +
+  stat_summary(aes(y = PollenTubeRateMean, x = AccessionNum),
+               fun = mean, geom = "crossbar", color = "blue", size = 0.4, position = position_nudge(x=3), width = 4.8) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 0.3) +
+  geom_point(aes(color=AccessionNum), size = 1) +
+  labs(x = "Pollen Donor", y = "Pollen Tube Growth Rate (ums/hour)", color = "Species") +
+  theme_classic() +
+  theme(legend.position = c(0.2, 0.85), 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(), 
+        panel.spacing = unit(0.1, "cm")) +
+  scale_color_manual(labels = c("SP", "SL"), values = c("#000075","#ff6700")) +
+  scale_shape_manual(values = c(17,16)) +
+  guides(color = guide_legend(override.aes = list(size = 2)))
+
+#One point for each style recipient across 5 different pollen recipients
+library(dplyr)
+
+new_df <- InVivoPollenTubeGrowthMeansTime %>%
+  dplyr::group_by(SpPollenDonor, SpPollenRecipient, Species, LowPollen) %>%
+  summarise(AvgPollenTubeLengthPerHour = mean(pollenTubeLengthMeansPerHour, na.rm = TRUE))
+
+new_df %>%
+  filter(LowPollen == F) %>%
+  ggplot(aes(x = SpPollenDonor, y = AvgPollenTubeLengthPerHour)) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 0.5) +
+  stat_summary(aes(y = AvgPollenTubeLengthPerHour, x = Species),
+               fun = mean, geom = "crossbar", color = "blue", size = 0.3, position = position_nudge(x=3), width = 4.8) +
+  geom_point(aes(color=Species), size = 1) +
+  ylim(0,1000) +
+   labs(#title = 'In-Vivo Pollen Tube Growth Rate Per Hour without Low Pollen Samples',
+       x='Pollen Donor',
+       y='Pollen Tube Growth Rate (um/hour)',
+       color = "Species") +
+  theme_classic() +
+  theme(legend.position = c(0.9, 0.85),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + 
+        #axis.title = element_text(size = 40),
+        #legend.text = element_text(size = 36), 
+        #legend.title = element_text(size = 40), 
+        #strip.text = element_text(size = 36), 
+        #axis.text = element_text(size = 36),
+        #title = element_text(size = 45)) +
+  scale_color_manual(labels = c("SP", "SL"), values = c("#000075","#ff6700")) +
+  guides(color = guide_legend(override.aes = list(size = 2)))
+  
+
+pollenMDFLycoPenn %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "M82", "S. lycopersicum")) %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "716", "S. pennellii")) %>%
+  ggplot(aes(y = PollenTubeRateMean, x = SpInd)) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black") +
+  stat_summary(aes(y = PollenTubeRateMean, x = AccessionNum),
+               fun = mean, geom = "crossbar", color = "blue", size = 0.3, position = position_nudge(x=3)) +
+  geom_point(aes(color=AccessionNum), size = 1) +
+  labs(x = "Species and Individuals", y = "Pollen Tube Growth Rate (ums/hour)", color = "Species") +
+  theme_classic() +
+  theme(legend.position = c(0.2, 0.85), 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(), 
+        panel.spacing = unit(0.1, "cm")) +
+  scale_color_manual(labels = c("S. pennellii", "S. lycopersicum"), values = c("#000075","#ff6700")) +
+  scale_shape_manual(values = c(17,16))
+
+InVivoPollenTubeGrowthMeansTime %>%
+  ggplot(aes(x = SpCr, y = ProportionStyleTraveled)) +
+  geom_point(aes(color=SpPolAmnt), size = 6) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 1) +
+  stat_summary(aes(y = ProportionStyleTraveled, x = Species),
+               fun = mean, geom = "crossbar", color = "blue", size = 1.5, position = position_nudge(x=8)) +
+   labs(title = 'In-Vivo Pollen Tube Proportion Style Traveled',
+       x='Pollen Cross',
+       y='Proportion Style Traveled (Mean Pollen Tube Growth Rate/ Style Length)',
+       color = "Species and Mark for Low Pollen") +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(), 
+        axis.title = element_text(size = 40),
+        legend.text = element_text(size = 36), 
+        legend.title = element_text(size = 40), 
+        strip.text = element_text(size = 36), 
+        axis.text = element_text(size = 36),
+        title = element_text(size = 45))
+ 
+#significant effect of date because of two dates that had a high proportion of low pollen samples
+InVivoPollenTubeGrowthMeansTime %>%
+  ggplot(aes(x = factor(Date,level = c('2023-5-24','2023-5-29','2023-6-5','2023-6-12','2023-7-17','2023-7-27','2023-8-1','2023-8-7','2023-8-15','2023-8-21','2023-8-28')), y = ProportionStyleTraveled)) +
+  geom_point(aes(color=SpPolAmnt), size = 6) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 1) +
+   labs(title = 'In-Vivo Pollen Tube Proportion Style Traveled by Date',
+       x='Date',
+       y='Proportion Style Traveled (Mean Pollen Tube Growth Rate/ Style Length)',
+       color = "Species and Mark for Low Pollen") +
+   theme(
+        axis.text.x = element_text(angle = 35, hjust = 1)) 
+
+
+InVivoPollenTubeGrowthMeansTime %>%
+  ggplot(aes(x = SpPollenRecipient, y = pollenTubeLengthMeansPerHour)) +
+  geom_point(aes(color=SpPolAmnt), size = 6) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 1) +
+   labs(title = 'In-Vivo Pollen Tube Growth Rate for Pollen Recipient Genotypes',
+       x='Species and Pollen Recipient',
+       y='Pollen Tube Growth Rate (um/hour)',
+       color = "Species and Mark for Low Pollen") +
+  theme(axis.title = element_text(size = 40),
+        legend.text = element_text(size = 36), 
+        legend.title = element_text(size = 40), 
+        strip.text = element_text(size = 36), 
+        axis.text = element_text(size = 36),
+        title = element_text(size = 45))
+
+InVivoPollenTubeGrowthMeansTime %>%
+  filter(LowPollen == F) %>%
+  ggplot(aes(x = SpPollenRecipient, y = pollenTubeLengthMeansPerHour)) +
+  geom_point(aes(color=Species), size = 6) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 1) +
+   labs(title = 'In-Vivo Pollen Tube Growth Rate for Pollen Recipient Genotypes without Low Pollen Samples',
+       x='Species and Pollen Recipient',
+       y='Pollen Tube Growth Rate (um/hour)',
+       color = "Species") +
+  theme(axis.title = element_text(size = 40),
+        legend.text = element_text(size = 36), 
+        legend.title = element_text(size = 40), 
+        strip.text = element_text(size = 36), 
+        axis.text = element_text(size = 36),
+        title = element_text(size = 45))
+
+InVivoPollenTubeGrowthMeansTime %>%
+  ggplot(aes(x = SpPollenDonor, y = pollenTubeLengthMeansPerHour)) +
+  geom_point(aes(color=SpPolAmnt), size = 6) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 1) +
+   labs(title = 'In-Vivo Pollen Tube Growth Rate for Pollen Donor Genotypes',
+       x='Species and Pollen Donor',
+       y='Pollen Tube Growth Rate (um/hour)',
+       color = "Species and Mark for Low Pollen") +
+  theme(axis.title = element_text(size = 40),
+        legend.text = element_text(size = 36), 
+        legend.title = element_text(size = 40), 
+        strip.text = element_text(size = 36), 
+        axis.text = element_text(size = 36),
+        title = element_text(size = 45))
+
+#good example of adding statistics to R plots
+InVivoPollenTubeGrowthMeansTime %>%
+  filter(LowPollen == F) %>%
+  ggplot(aes(x = Species, y = pollenTubeLengthMeansPerHour)) +
+  geom_boxplot(size = 0.5, outlier.size = 0.1) +
+  geom_dotplot(aes(fill = Species), dotsize = 0.5, binaxis = "y", stackdir = "center") +
+  #stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 1) +
+   labs(#title = 'In-Vivo Pollen Tube Growth Rate for Pollen Donor Genotypes without Low Pollen Samples',
+       x='Species',
+       y='Pollen Tube Growth Rate (um/hour)',
+       color = "Species") +
+  theme_classic() +
+  theme(axis.title = element_text(size = 8),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        axis.text = element_text(size = 8),
+        title = element_text(size = 8),
+        legend.position = "none") + 
+  scale_y_continuous(limits = c(0,1000)) +
+  stat_compare_means(method = "t.test") +
+  geom_signif(comparisons = list(c("LA0716", "M82")), 
+              map_signif_level=TRUE)
+
+
+InVivoPollenTubeGrowthMeansTime %>%
+  filter(LowPollen == F) %>%
+  ggplot(aes(x = SpCr, y = pollenTubeLengthMeansPerHour)) +
+  geom_boxplot(size = 0.5, outlier.size = 0.1) +
+  geom_dotplot(aes(fill = Species), dotsize = 0.5, binaxis = "y", stackdir = "center") +
+  #stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 1) +
+   labs(#title = 'In-Vivo Pollen Tube Growth Rate for Pollen Donor Genotypes without Low Pollen Samples',
+       x='Species and Crosses (Recipient_Donor)',
+       y='Pollen Tube Growth Rate (um/hour)',
+       color = "Species") +
+  theme_classic() +
+  theme(axis.title = element_text(size = 8),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        axis.text = element_text(size = 8),
+        title = element_text(size = 8),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 35, hjust = 1)) + 
+  scale_y_continuous(limits = c(0,1000)) #+
+#stat_compare_means(comparisons = "Species", method = "t.test")
+
+
+
+InVivoPollenTubeGrowthMeansTime %>%
+  filter(LowPollen == F) %>%
+  ggplot(aes(x = SpCr, y = pollenTubeLengthMeansPerHour)) +
+  geom_boxplot(size = 0.5, outlier.size = 0.1) +
+  geom_dotplot(aes(fill = Species), dotsize = 0.5, binaxis = "y", stackdir = "center") +
+  stat_compare_means(method = "t.test")  # Add this line
+
+ 
+  InVivoPollenTubeGrowthMeansTime %>%
+  filter(LowPollen == F) %>%
+  ggplot(aes(x = SpPollenDonor, y = pollenTubeLengthMeansPerHour)) +
+  geom_boxplot(size = 0.5, outlier.size = 0.1) +
+  geom_dotplot(aes(fill = Species), dotsize = 0.5, binaxis = "y", stackdir = "center") +
+  #stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 1) +
+   labs(#title = 'In-Vivo Pollen Tube Growth Rate for Pollen Donor Genotypes without Low Pollen Samples',
+       x='Species and Pollen Donor',
+       y='Pollen Tube Growth Rate (um/hour)',
+       color = "Species") +
+  theme_classic() +
+  theme(axis.title = element_text(size = 8),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        axis.text = element_text(size = 8),
+        title = element_text(size = 8),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 35, hjust = 1)) + 
+  scale_y_continuous(limits = c(0,1000))
+#Find me again
+
+InVivoPollenTubeGrowthMeansTime %>%
+  filter(LowPollen == F) %>%
+  ggplot(aes(x = Species, y = ProportionStyleTraveled)) +
+  geom_boxplot(size = 0.5, outlier.size = 0.1) +
+  geom_dotplot(aes(fill = Species), dotsize = 0.5, binaxis = "y", stackdir = "center") +
+  #stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", size = 1) +
+   labs(#title = 'In-Vivo Pollen Tube Growth Rate for Pollen Donor Genotypes without Low Pollen Samples',
+       x='Species',
+       y='Proportion of the Style Traveled',
+       color = "Species") +
+  theme_classic() +
+  theme(axis.title = element_text(size = 8),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        axis.text = element_text(size = 8),
+        title = element_text(size = 8),
+        legend.position = "none") #+ 
+  #scale_y_continuous(limits = c(0,1000))
+
+
+#inVitroPTGRA <- 
+pollenMDFLycoPenn %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "M82", "S. lycopersicum")) %>%
+  #mutate(AccessionNum = replace(AccessionNum, AccessionNum == "716", "S. pennellii")) %>%
+  #ggplot(aes())
+  ggplot(aes(y = PollenTubeRateMean, x = AccessionNum)) +
+  geom_boxplot(size = 0.5, outlier.size = 0.1) +
+  geom_dotplot(aes(fill = AccessionNum), dotsize = 0.5, binaxis = "y", stackdir = "center") +
+  #stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black") +
+  #stat_summary(aes(y = PollenTubeRateMean, x = AccessionNum),
+  #             fun = mean, geom = "crossbar", color = "blue", size = 0.3, position = position_nudge(x=3)) +
+  labs(x = "Species", y = "Pollen Tube Growth Rate (ums/hour)", color = "Species") +
+  theme_classic() +
+  theme(legend.position = "none",
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 8), 
+        strip.text = element_text(size = 8), 
+        panel.spacing = unit(0.1, "cm")) +
+  #scale_y_continuous(limits = c(0,1000)) +
+  scale_color_manual(labels = c("S. pennellii", "S. lycopersicum"), values = c("#ff6700","#311432")) +
+  scale_shape_manual(values = c(17,16))
+
+inVitroPTGRA 
+
+InVivoPollenTubeGrowthMeansTime %>%
+  ggplot(aes(x = StyleLength_um, y = pollenTubeLengthMeansPerHour, color = SpPolAmnt)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+#### In-Vivo Stats ####
+
+#For the mean pollen tube growth rate the important (significant) factors are (from most to least significant): Whether or not the cross had few pollen grains delivered, the species, and the style length
+#If there were few pollen grains the pollen tube growth rate was less. LA0716 had longer pollen tube growth rate, and longer styles had faster pollen tube growth
+
+#For the proportion of style traveled the important (significant) factors are (from most to least significant): Whether or not the cross had few pollen grains delivered, and the date emasculated
+
+summary(aov(pollenTubeLengthMeansPerHour ~ Species, data = InVivoPollenTubeGrowthMeansTime))
+IVAov1 <- aov(InVivoPollenTubeGrowthMeansTime$pollenTubeLengthMeansPerHour~InVivoPollenTubeGrowthMeansTime$Species/factor(InVivoPollenTubeGrowthMeansTime$SpCr)) #
+summary(IVAov1)
+
+IVAov2 <- aov(pollenTubeLengthMeansPerHour ~ Species * LowPollen * Date * Time * StyleLength_um, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov2)
+
+# Get the summary of the ANOVA model
+summary_IVAov1 <- summary(IVAov1)
+
+# Convert the summary to a data frame
+summary_IVAov1_df <- data.frame(summary_IVAov1[[1]])
+
+# Write the summary to a CSV file
+write.csv(summary_IVAov1_df, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/InVivoGrowthWIndividuals.csv")
+
+
+TukeyHSD(IVAovSpecies, "Species")
+
+IVAovSpecies <- aov(pollenTubeLengthMeansPerHour ~ Species, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAovSpecies)
+
+plot(TukeyHSD(IVAovSpecies, "Species"))
+
+IVAov2b <- aov(pollenTubeLengthMeansPerHour ~ Species + LowPollen + Date + Time + StyleLength_um + Species/as.factor(SpPollenDonor) + Species/as.factor(SpPollenRecipient) + Species/as.factor(SpCr), data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov2b)
+
+TukeyHSD(IVAov2b, "Species")
+
+IVAov2c <- aov(pollenTubeLengthMeansPerHour ~ Species + Date + Time + StyleLength_um + Species/as.factor(SpPollenDonor) + Species/as.factor(SpPollenRecipient) + Species/as.factor(SpCr), data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov2c)
+
+LowPollenFalse <- InVivoPollenTubeGrowthMeansTime %>%
+  filter(LowPollen == FALSE)
+
+IVAov2d <- aov(pollenTubeLengthMeansPerHour ~ Species + Date + Time + StyleLength_um + Species/as.factor(SpPollenDonor) + Species/as.factor(SpPollenRecipient) + Species/as.factor(SpCr), data = LowPollenFalse)
+
+summary(IVAov2d)
+
+IVAov2e <- aov(ProportionStyleTraveled ~ Species + Date + Time + StyleLength_um + Species/as.factor(SpPollenDonor) + Species/as.factor(SpPollenRecipient) + Species/as.factor(SpCr), data = LowPollenFalse)
+
+summary(IVAov2e)
+
+IVAov2f <- aov(ProportionStyleTraveled ~ Species + LowPollen + Date + Time + StyleLength_um + Species/as.factor(SpPollenDonor) + Species/as.factor(SpPollenRecipient) + Species/as.factor(SpCr), data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov2f)
+
+
+IVlm <- lm(pollenTubeLengthMeansPerHour ~ Species + SpCr, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVlm)
+
+IVAov3 <- aov(pollenTubeLengthMeansPerHour ~ Species * LowPollen * SpPollenDonor * SpPollenRecipient * StyleLength_um, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov3)
+
+IVAov4 <- aov(ProportionStyleTraveled ~ Species * LowPollen * Date * Time * StyleLength_um, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov4)
+
+IVAov4b <- aov(ProportionStyleTraveled ~ Species + LowPollen + Date + Time + StyleLength_um + SpPollenDonor + SpPollenRecipient + SpCr, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov4b)
+
+IVlm <- lm(ProportionStyleTraveled ~ Species + SpCr, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVlm)
+
+IVAov5 <- aov(ProportionStyleTraveled ~ Species * LowPollen * SpPollenDonor * SpPollenRecipient * StyleLength_um, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov5)
+
+IVAov6 <-aov(pollenTubeLengthMeansPerHour ~ Species/as.factor(SpCr) + SpPollenDonor + SpPollenRecipient, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov6)
+
+IVAov7 <-aov(ProportionStyleTraveled ~ Species/as.factor(SpCr) + SpPollenDonor + SpPollenRecipient, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov7)
+
+IVAov8 <-aov(pollenTubeLengthMeansPerHour ~ Species/as.factor(SpPollenDonor), data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov8)
+
+IVAov9 <- aov(pollenTubeLengthMeansPerHour ~ SpCr, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov9)
+
+IVAov10 <-aov(pollenTubeLengthMeansPerHour ~ Species/as.factor(SpCr) + SpPollenDonor + SpPollenRecipient, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov10)
+
+IVAov11 <-aov(ProportionStyleTraveled ~ StyleLength_um + SpPollenDonor + SpPollenRecipient + Date, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov11)
+
+TukeyHSD(IVAov11, "Date")
+
+IVAov12 <-aov(ProportionStyleTraveled ~ Date, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov12)
+
+TukeyHSD(IVAov12, "Date")
+
+#Date was only significant because of two days with mostly low pollen samples
+IVAov13 <-aov(ProportionStyleTraveled ~  LowPollen * Date, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVAov13)
+
+TukeyHSD(IVAov13, "Date")
+
+IVGLM1 <- glm(formula = ProportionStyleTraveled ~ Species + LowPollen + Date + Time + StyleLength_um + SpPollenDonor + SpPollenRecipient + SpCr, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVGLM1)
+
+IVGLM2 <- glm(formula = pollenTubeLengthMeansPerHour ~ Species + LowPollen + Date + Time + StyleLength_um + SpPollenDonor + SpPollenRecipient + SpCr, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVGLM2)
+
+IVGLM3 <- glm(formula = pollenTubeLengthMeansPerHour ~ Species * StyleLength_um, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(IVGLM3)
+
+NoLowPollen <- InVivoPollenTubeGrowthMeansTime %>%
+  filter(LowPollen == F)
+
+NLPSpecies <- aov(pollenTubeLengthMeansPerHour ~ Species, data = NoLowPollen)
+
+summary(NLPSpecies)
+
+NLPGLMSpecies <- glm(formula = pollenTubeLengthMeansPerHour ~ Species, data = NoLowPollen)
+
+summary(NLPGLMSpecies)
+
+M82InVivo <- InVivoPollenTubeGrowthMeansTime %>%
+  filter(Species =="M82")
+
+M82Aov1 <- lm(ProportionStyleTraveled ~ StyleLength_um * LowPollen, data = M82InVivo)
+
+summary(M82Aov1)
+
+LA0716InVivo <- InVivoPollenTubeGrowthMeansTime %>%
+  filter(Species =="LA0716")
+
+LA0716Aov1 <- lm(ProportionStyleTraveled ~ StyleLength_um, data = LA0716InVivo)
+
+summary(LA0716Aov1)
+
+styleLengthLM <- lm(StyleLength_um ~ Species, data = InVivoPollenTubeGrowthMeansTime)
+
+summary(styleLengthLM)
+
+styleLengthLM2 <- lm(StyleLength_um ~ Species/as.factor(SpPollenRecipient), data = InVivoPollenTubeGrowthMeansTime)
+
+summary(styleLengthLM2)
+
+#testing if variance is different b/w species
+PTGRIVVT <- var.test(pollenTubeLengthMeansPerHour ~ Species + as.factor(SpCr), InVivoPollenTubeGrowthMeansTime, alternative = "two.sided")
+PTGRIVVT
+
+view(InVivoPollenTubeGrowthMeansTime)
+LycoInVivoPollenTubeGrowthMeansTime <- InVivoPollenTubeGrowthMeansTime %>%
+  filter(Species == "M82")
+var(InVivoPollenTubeGrowthMeansTime$pollenTubeLengthMeansPerHour)*(94-1)/94
+
+view(LycoInVivoPollenTubeGrowthMeansTime)
+
+var(LycoInVivoPollenTubeGrowthMeansTime$pollenTubeLengthMeansPerHour)*(52-1)/52
+
+PennInVivoPollenTubeGrowthMeansTime <- InVivoPollenTubeGrowthMeansTime %>%
+  filter(Species == "LA0716")
+view(PennInVivoPollenTubeGrowthMeansTime)
+
+var(PennInVivoPollenTubeGrowthMeansTime$pollenTubeLengthMeansPerHour)*(42-1)/42
+```
+
+#unfrozen pollen in-vitro data
+```{r}
+UnfrozenInVitro <- data.frame(read.csv('/Users/tbiewerh/Desktop/LycoPennPollenTubeGrowthAssay/UnFrozenLycoPennInVitro.csv', header=T, row.names = NULL))
+
+UnfrozenAverages <- UnfrozenInVitro %>%
+  drop_na() %>%
+  unite("TestSpInd", c(Test, AccessionNum, IndividualNum), remove = F) %>%
+  dplyr::group_by(TestSpInd) %>%
+  dplyr::select(-PollenSampleGridNumber) %>%
+  dplyr::mutate(PollenDiameterMean = mean(umPollenDiameter)) %>%
+  dplyr::mutate(PollenDiameterStdDev = sqrt(var(umPollenDiameter))) %>%
+  dplyr::mutate(PollenTubeLengthMean = mean(umPollenTubeLength)) %>%
+  dplyr::mutate(PollenTubeLengthStdDev = sqrt(var(umPollenTubeLength))) %>%
+  dplyr::group_by(TestSpInd) %>%
+  dplyr::select(-c(umPollenDiameter, umPollenTubeLength)) %>%
+  distinct() %>%
+  unite("TestInd", c(Test,IndividualNum), remove = F) %>%
+  dplyr::mutate(ProportionGerminated = NumGerminated/NumHealthyPollen) %>%
+  dplyr::mutate(ProportionBurst = NumBurstPollenTubes/NumGerminated) %>%
+  unite("SpInd", c(AccessionNum, IndividualNum), remove = F) %>%
+  dplyr::mutate(PollenTubeRateMean = PollenTubeLengthMean/3) %>%
+  dplyr::ungroup()
+
+UnfrozenAverages %>%
+  ggplot(aes(y = PollenDiameterMean, x = SpInd)) +
+  geom_point(aes(color=AccessionNum), size = 1) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black") +
+  stat_summary(aes(y = PollenDiameterMean, x = AccessionNum),
+               fun = mean, geom = "crossbar", color = "blue", size = 0.3, position = position_nudge(x=1.5)) +
+  labs(x = "Species and Individuals", y = "Pollen Diameter (ums)", color = "Species") +
+  theme(legend.position = c(0.1, 0.14),
+        legend.text = element_text(size = 12), 
+        legend.title = element_text(size = 12), 
+        strip.text = element_text(size = 12), 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(), 
+        panel.spacing = unit(0.1, "cm"))
+
+UnfrozenAverages %>%
+  ggplot(aes(y = PollenTubeLengthMean, x = SpInd)) +
+  geom_point(aes(color=AccessionNum), size = 1) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black") +
+  stat_summary(aes(y = PollenTubeLengthMean, x = AccessionNum),
+               fun = mean, geom = "crossbar", color = "blue", size = 0.3, position = position_nudge(x=1.5)) +
+  labs(x = "Species and Individuals", y = "Pollen Tube Length (ums)", color = "Species") +
+  theme(legend.position = c(0.1, 0.14),
+        legend.text = element_text(size = 12), 
+        legend.title = element_text(size = 12), 
+        strip.text = element_text(size = 12), 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(), 
+        panel.spacing = unit(0.1, "cm"))
+
+UFAOV <- aov(PollenTubeRateMean~AccessionNum/factor(SpInd), data = UnfrozenAverages)
+summary(UFAOV)
+
+
+```
+#Checking out spermidine expression
+```{r}
+#Spermidine genes: Solyc04g026030.3, Solyc06g053520.4, Solyc07g041300.2, Solyc08g014310.3, Solyc09g075900.3, Solyc05g005710.4
+#None of these are specific or biased towards pollen or style, only two have style or pollen expression and they have much more in leaf. Either spermidine isn't as important for pollen tube growth in Solanum, or spermidine genes in pollen haven't been identified
+```
+
+#Making a section for in-vivo and in-vitro results tables
+```{r}
+
+# Assuming there are only two AccessionNum designations
+group1 <- filter(pollenMDFLycoPenn, AccessionNum == unique(pollenMDFLycoPenn$AccessionNum)[1])
+group2 <- filter(pollenMDFLycoPenn, AccessionNum == unique(pollenMDFLycoPenn$AccessionNum)[2])
+
+t_tests <- data.frame(
+  Measurement = character(),
+  df = numeric(),
+  statistic = numeric(),
+  p_value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Perform the t-tests and add the results to the t_tests data frame
+for (measurement in names(select(group1, PollenDiameterMean:PollenTubeRateMean))) {
+  test_result <- broom::tidy(t.test(group1[[measurement]], group2[[measurement]]))
+  test_result$Measurement <- measurement
+  test_result$LA0716estimate <- test_result$estimate1
+  test_result$M82estimate <- test_result$estimate2
+  test_result <- test_result[, c("Measurement", "LA0716estimate", "M82estimate", "statistic", "p.value")]
+  t_tests <- rbind(t_tests, test_result)
+}
+
+ #Reorder the columns so that "Measurement" is the first column
+t_tests <- t_tests[, c("Measurement", names(t_tests)[-1])]
+
+write.csv(t_tests, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/inVitro_tests.csv", row.names = FALSE)
+
+#Here's for the unfrozen invitro data
+library(dplyr)
+
+group1 <- filter(UnfrozenAverages, AccessionNum == unique(UnfrozenAverages$AccessionNum)[1])
+group2 <- filter(UnfrozenAverages, AccessionNum == unique(UnfrozenAverages$AccessionNum)[2])
+
+# Select only the AccessionNum column and every column from PollenDiameterMean to PollenTubeRateMean
+group1 <- select(group1, AccessionNum, PollenDiameterMean:PollenTubeRateMean)
+group2 <- select(group2, AccessionNum, PollenDiameterMean:PollenTubeRateMean)
+
+t_tests <- data.frame(
+  Measurement = character(),
+  df = numeric(),
+  statistic = numeric(),
+  p_value = numeric(),
+  stringsAsFactors = FALSE
+)
+# Check the structure of the UnfrozenAverages data frame
+str(UnfrozenAverages)
+
+# Check the unique values in the PollenDiameterMean and PollenTubeRateMean columns
+unique(UnfrozenAverages$PollenDiameterMean)
+unique(UnfrozenAverages$PollenTubeRateMean)
+
+
+# Perform the t-tests and add the results to the t_tests data frame
+for (measurement in names(select(group1, PollenDiameterMean:PollenTubeRateMean))) {
+  # Convert the columns to numeric and remove NA values
+  group1[[measurement]] <- as.numeric(group1[[measurement]])
+  group1[[measurement]] <- na.omit(group1[[measurement]])
+  group2[[measurement]] <- as.numeric(group2[[measurement]])
+  group2[[measurement]] <- na.omit(group2[[measurement]])
+
+  # Perform the t-test
+  test_result <- broom::tidy(t.test(group1[[measurement]], group2[[measurement]], na.rm = TRUE))
+  test_result$Measurement <- measurement
+  test_result$LA0716estimate <- test_result$estimate1
+  test_result$M82estimate <- test_result$estimate2
+  test_result <- test_result[, c("Measurement", "LA0716estimate", "M82estimate", "statistic", "p.value")]
+  t_tests <- rbind(t_tests, test_result)
+}
+
+# Reorder the columns so that "Measurement" is the first column
+t_tests <- t_tests[, c("Measurement", names(t_tests)[-1])]
+
+write.csv(t_tests, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/UnfrozeninVitro_tests.csv", row.names = FALSE)
+
+# Here's for the InVivoPollenTubeGrowthMeansTime data
+library(dplyr)
+
+group1 <- filter(InVivoPollenTubeGrowthMeansTime, Species == unique(InVivoPollenTubeGrowthMeansTime$Species)[1])
+group2 <- filter(InVivoPollenTubeGrowthMeansTime, Species == unique(InVivoPollenTubeGrowthMeansTime$Species)[2])
+
+# Select only the AccessionNum column and every column from PollenDiameterMean to PollenTubeRateMean
+group1 <- select(group1, Species, StyleLength_um, PollenTubeLengthMean:PollenTubeLengthStdDev, pollenTubeLengthMeansPerHour:ProportionStyleTraveled)
+group2 <- select(group2, Species, StyleLength_um, PollenTubeLengthMean:PollenTubeLengthStdDev, pollenTubeLengthMeansPerHour:ProportionStyleTraveled)
+
+t_tests <- data.frame(
+  Measurement = character(),
+  df = numeric(),
+  statistic = numeric(),
+  p_value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Check the structure of the InVivoPollenTubeGrowthMeansTime data frame
+str(InVivoPollenTubeGrowthMeansTime)
+
+# Check the unique values in the PollenDiameterMean and PollenTubeRateMean columns
+#unique(InVivoPollenTubeGrowthMeansTime$PollenDiameterMean)
+#unique(InVivoPollenTubeGrowthMeansTime$PollenTubeRateMean)
+
+# Perform the t-tests and add the results to the t_tests data frame
+for (measurement in names(select(group1, StyleLength_um:ProportionStyleTraveled))) {
+  # Convert the columns to numeric and remove NA values
+  group1[[measurement]] <- as.numeric(group1[[measurement]])
+  group1[[measurement]] <- na.omit(group1[[measurement]])
+  group2[[measurement]] <- as.numeric(group2[[measurement]])
+  group2[[measurement]] <- na.omit(group2[[measurement]])
+
+  # Perform the t-test
+  test_result <- broom::tidy(t.test(group1[[measurement]], group2[[measurement]], na.rm = TRUE))
+  test_result$Measurement <- measurement
+  test_result$LA0716estimate <- test_result$estimate2
+  test_result$M82estimate <- test_result$estimate1
+  test_result <- test_result[, c("Measurement", "LA0716estimate", "M82estimate", "statistic", "p.value")]
+  t_tests <- rbind(t_tests, test_result)
+}
+
+# Reorder the columns so that "Measurement" is the first column
+t_tests <- t_tests[, c("Measurement", names(t_tests)[-1])]
+
+write.csv(t_tests, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/InVivoPollenTubeGrowthMeansTime_tests.csv", row.names = FALSE, append = FALSE)
+```
+
+#comparing stats from unfrozen and frozen in-vitro assays
+```{r}
+#First for 0716
+# Filter the data frames by the AccessionNum of interest
+accession_num <- 716
+unfrozen <- filter(UnfrozenAverages, AccessionNum == accession_num)
+pollen <- filter(pollenMDFLycoPenn, AccessionNum == accession_num)
+
+# Initialize a data frame to store the t-test results
+t_tests <- data.frame(
+  Measurement = character(),
+  df = numeric(),
+  statistic = numeric(),
+  p_value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Get the column names from PollenDiameterMean to PollenTubeRateMean
+measurements <- names(unfrozen)[which(names(unfrozen) == "PollenDiameterMean"):which(names(unfrozen) == "PollenTubeRateMean")]
+
+# Perform the t-tests and add the results to the t_tests data frame
+for (measurement in measurements) {
+  # Perform the t-test
+  test_result <- broom::tidy(t.test(unfrozen[[measurement]], pollen[[measurement]], na.rm = TRUE))
+  test_result$Measurement <- measurement
+  test_result$UnfrozenEstimate <- test_result$estimate1
+  test_result$PollenEstimate <- test_result$estimate2
+  test_result <- test_result[, c("Measurement", "UnfrozenEstimate", "PollenEstimate", "statistic", "p.value")]
+  t_tests <- rbind(t_tests, test_result)
+}
+
+# Reorder the columns so that "Measurement" is the first column
+t_tests <- t_tests[, c("Measurement", names(t_tests)[-1])]
+
+write.csv(t_tests, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/Unfrozen0716VFrozen0716.csv", row.names = FALSE, append = FALSE)
+
+
+#Next for M82
+# Filter the data frames by the AccessionNum of interest
+accession_num <- "M82"
+unfrozen <- filter(UnfrozenAverages, AccessionNum == accession_num)
+pollen <- filter(pollenMDFLycoPenn, AccessionNum == accession_num)
+
+# Initialize a data frame to store the t-test results
+t_tests <- data.frame(
+  Measurement = character(),
+  df = numeric(),
+  statistic = numeric(),
+  p_value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Get the column names from PollenDiameterMean to PollenTubeRateMean
+measurements <- names(unfrozen)[which(names(unfrozen) == "PollenDiameterMean"):which(names(unfrozen) == "PollenTubeRateMean")]
+
+# Perform the t-tests and add the results to the t_tests data frame
+for (measurement in measurements) {
+  # Perform the t-test
+  test_result <- broom::tidy(t.test(unfrozen[[measurement]], pollen[[measurement]], na.rm = TRUE))
+  test_result$Measurement <- measurement
+  test_result$UnfrozenEstimate <- test_result$estimate1
+  test_result$PollenEstimate <- test_result$estimate2
+  test_result <- test_result[, c("Measurement", "UnfrozenEstimate", "PollenEstimate", "statistic", "p.value")]
+  t_tests <- rbind(t_tests, test_result)
+}
+
+# Reorder the columns so that "Measurement" is the first column
+t_tests <- t_tests[, c("Measurement", names(t_tests)[-1])]
+
+write.csv(t_tests, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/UnfrozenM82VFrozenM82.csv", row.names = FALSE, append = FALSE)
+
+```
+
+
+#Section for making revisions and compiling results for publication
+```{r}
+#Writing linear models to a summary folder that I can report
+# Load the necessary library
+library(broom)
+
+# Create a list to store the summaries of your linear models
+model_summaries <- list()
+
+# Add the summaries of your linear models to the list
+model_summaries$pEPB <- tidy(summary(pEPB))
+model_summaries$sEPB <- tidy(summary(sEPB))
+model_summaries$lEPB <- tidy(summary(lEPB))
+model_summaries$tauPB <- tidy(summary(tauPB))
+model_summaries$tauLB <- tidy(summary(tauLB))
+model_summaries$tpmLB <- tidy(summary(tpmLB))
+model_summaries$tauSB <- tidy(summary(tauSB))
+model_summaries$tpmSB <- tidy(summary(tpmSB))
+model_summaries$PMEPB <- tidy(summary(PMEPB))
+model_summaries$difTest <- tidy(summary(difTest))
+model_summaries$PMEStylarDifTest <- tidy(summary(PMEStylarDifTest))
+model_summaries$PMEIStylarDifTest <- tidy(summary(PMEIStylarDifTest))
+
+# Write the summaries of your linear models to a CSV file
+for (model_name in names(model_summaries)) {
+  write.csv(model_summaries[[model_name]], file = paste0("/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/", model_name, ".csv"))
+}
+
+view(styleExpressionPollenBiased)
+
+#figuring out how many pollen biased genes have greater expression in pen because of no expression in lyc
+# Filter the data frame
+# Create the first data frame
+df_pen <- styleExpressionPollenBiased[styleExpressionPollenBiased$species == "pen" & styleExpressionPollenBiased$log2Expression > 0, ]
+
+# Create the second data frame
+df_lyc <- styleExpressionPollenBiased[styleExpressionPollenBiased$species == "lyc" & styleExpressionPollenBiased$log2Expression <= 0, ]
+
+# Find the GeneID that match between the two data frames
+matching_gene_id <- intersect(df_pen$GeneID, df_lyc$GeneID)
+
+# Count the number of matching GeneID
+num_matching_gene_id <- length(matching_gene_id)
+
+num_matching_gene_id
+
+view(matching_gene_id)
+
+lycoPollenBiasNew <- masterDFNew %>%
+  filter(species == "lyc") %>%
+  filter(biased == "pollen")
+pennPollenBiasNew <- masterDFNew %>%
+  filter(species == "pen") %>%
+  filter(biased == "pollen")
+lycoStyleBiasedNew <- masterDFNew %>%
+  filter(species == "lyc") %>%
+  filter(biased == "styungerm")
+pennStyleBiasedNew <- masterDFNew %>%
+  filter(species == "pen") %>%
+  filter(biased == "styungerm")
+lycoLeafBiasedNew <- masterDFNew %>%
+  filter(species == "lyc") %>%
+  filter(biased == "leaf")
+pennLeafBiasedNew <- masterDFNew %>%
+  filter(species == "pen") %>%
+  filter(biased == "leaf")
+
+view(pennLeafBiasedNew)
+#fixing the biased column
+testMasterDFNew <- masterDFNew
+
+modifiedTestMasterDFNew<-testMasterDFNew %>%
+  mutate(biased = ifelse(species == "lyc" & GeneID %in% lycoPollenBiasNew$GeneID, "pollen",
+  ifelse(species == "lyc" & GeneID %in% lycoStyleBiasedNew$GeneID, "styungerm",
+  ifelse(species == "lyc" & GeneID %in% lycoLeafBiasedNew$GeneID, "leaf",
+  ifelse(species == "pen" & GeneID %in% pennPollenBiasNew$GeneID, "pollen",
+  ifelse(species == "pen" & GeneID %in% pennStyleBiasedNew$GeneID, "styungerm",
+  ifelse(species == "pen" & GeneID %in% pennLeafBiasedNew$GeneID, "leaf", "unbiased")))))))
+
+view(modifiedTestMasterDFNew)
+view(masterDFNew)
+
+masterDFNewTestNew <- modifiedTestMasterDFNew %>%
+  dplyr::select(GeneID,TPM,TPMError,tau:tissue,specific:biased,chromosome,log2Expression,Error,log10Expression,log10Error)
+view(masterDFNewTestNew)
+masterDFNew <- masterDFNewTestNew
+pollenBiasedNew <- masterDFNew %>%
+  filter(biased == "pollen")
+
+#this should allow genes to be biased in either species
+pollenBiasedGenes <- masterDFNew %>%
+  filter(GeneID %in% pollenBiased$GeneID)
+  
+view(pollenBiasedGenes)
+
+write.csv(pollenBiasedGenes, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData12_PollenBiasedGenes.csv", row.names = FALSE)
+
+PMEPMEIResultsDF<- masterDFNew %>%
+  dplyr::filter(PME == TRUE | PMEI == TRUE) %>%
+  dplyr::select(-c(SpTis))
+view(PMEPMEIResultsDF)
+write.csv(PMEPMEIResultsDF, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData8_PMEPMEIResults.csv", row.names = FALSE)
+```
+
+#Reformatting PME and PMEI results, averging the results df, and formatting it according to Leonie's specifications
+```{r}
+view(masterDFNew)
+
+PMEsWide <- masterDFNew %>%
+  dplyr::filter(PME == TRUE) %>%
+  dplyr::select(-c(PME,PMEI,TPMError,species, tissue,chromosome,log2Expression,Error, log10Expression,log10Error, log2Expression)) %>%
+  arrange(GeneID) %>%
+  pivot_wider(id_cols = GeneID, names_from = SpTis, values_from = c(TPM, tau, biased)) %>%
+  dplyr::mutate(tau_lycopersicum = tau_lyc_styungerm, tau_pennellii = tau_pen_leaf) %>%
+  dplyr::select(-c(tau_lyc_pollen, tau_lyc_leaf, tau_lyc_styungerm, tau_pen_styungerm, tau_pen_pollen, tau_pen_leaf)) %>%
+  dplyr::mutate(bias_lycopersicum = biased_lyc_styungerm, bias_pennellii = biased_pen_leaf) %>%
+  dplyr::select(-c(biased_lyc_pollen, biased_lyc_leaf, biased_lyc_styungerm, biased_pen_styungerm, biased_pen_pollen, biased_pen_leaf)) %>%
+  dplyr::relocate(GeneID,TPM_lyc_pollen, TPM_pen_pollen, TPM_lyc_styungerm, TPM_pen_styungerm, TPM_lyc_leaf, TPM_pen_leaf, tau_lycopersicum, tau_pennellii, bias_lycopersicum, bias_pennellii)
+
+view(PMEsWide)
+
+PMEIsWide <- masterDFNew %>%
+  dplyr::filter(PMEI == TRUE) %>%
+  dplyr::select(-c(PME,PMEI,TPMError,species, tissue,chromosome,log2Expression,Error, log10Expression,log10Error, log2Expression)) %>%
+  arrange(GeneID) %>%
+  pivot_wider(id_cols = GeneID, names_from = SpTis, values_from = c(TPM, tau, biased)) %>%
+  dplyr::mutate(tau_lycopersicum = tau_lyc_styungerm, tau_pennellii = tau_pen_leaf) %>%
+  dplyr::select(-c(tau_lyc_pollen, tau_lyc_leaf, tau_lyc_styungerm, tau_pen_styungerm, tau_pen_pollen, tau_pen_leaf)) %>%
+  dplyr::mutate(bias_lycopersicum = biased_lyc_styungerm, bias_pennellii = biased_pen_leaf) %>%
+  dplyr::select(-c(biased_lyc_pollen, biased_lyc_leaf, biased_lyc_styungerm, biased_pen_styungerm, biased_pen_pollen, biased_pen_leaf)) %>%
+  dplyr::relocate(GeneID,TPM_lyc_pollen, TPM_pen_pollen, TPM_lyc_styungerm, TPM_pen_styungerm, TPM_lyc_leaf, TPM_pen_leaf, tau_lycopersicum, tau_pennellii, bias_lycopersicum, bias_pennellii)
+
+view(PMEIsWide)
+
+PMEReadCountsWide <- readCounts %>%
+  dplyr::filter(Geneid %in% PMEsWide$GeneID) %>%
+  add_column(Lyc_pollen_counts = rowMeans(dplyr::select(., c(Slyc_polgerm1,Slyc_polgerm2,Slyc_polgerm3,Slyc_polungerm1,Slyc_polungerm2,Slyc_polungerm3)))) %>%
+  add_column(Pen_pollen_counts = rowMeans(dplyr::select(., c(Spen_polgerm1,Spen_polgerm2,Spen_polgerm3,Spen_polungerm1,Spen_polungerm2,Spen_polungerm3)))) %>%
+  add_column(Lyc_style_counts = rowMeans(dplyr::select(., c(Slyc_styungerm1,Slyc_styungerm2,Spen_styungerm3)))) %>%
+  add_column(Pen_style_counts = rowMeans(dplyr::select(., c(Spen_styungerm1,Spen_styungerm2,Spen_styungerm3)))) %>%
+  add_column(Lyc_leaf_counts = rowMeans(dplyr::select(., c(Slyc_leafP3r1,Slyc_leafP3r2,Slyc_leafP3r3,Slyc_leafP4d1,Slyc_leafP4d2,Slyc_leafP4d3,Slyc_leafP4p1,Slyc_leafP4p2,Slyc_leafP4p3,Slyc_leafP5d1,Slyc_leafP5d2,Slyc_leafP5d3,Slyc_leafP5p1,Slyc_leafP5p2,Slyc_leafP5p3,Slyc_leafP6d1,Slyc_leafP6d2,Slyc_leafP6p3)))) %>%
+  add_column(Pen_leaf_counts = rowMeans(dplyr::select(., c(Spen_leafP3r1,Spen_leafP3r2,Spen_leafP3r3,Spen_leafP4d1,Spen_leafP4d2,Spen_leafP4d3,Spen_leafP4p1,Spen_leafP4p2,Spen_leafP4p3,Spen_leafP5d1,Spen_leafP5d2,Spen_leafP5d3,Spen_leafP5p1,Spen_leafP5p2,Spen_leafP5p3,Spen_leafP6d1,Spen_leafP6d2,Spen_leafP6p3)))) %>%
+  select(c(Geneid,Lyc_pollen_counts,Pen_pollen_counts,Lyc_style_counts,Pen_style_counts,Lyc_leaf_counts,Pen_leaf_counts)) %>%
+  dplyr::left_join(results_df, by = c("Geneid" = "Gene")) %>%
+  arrange("Geneid")
+
+view(PMEReadCountsWide)
+
+PMEIReadCountsWide <- readCounts %>%
+  dplyr::filter(Geneid %in% PMEIsWide$GeneID) %>%
+  add_column(Lyc_pollen_counts = rowMeans(dplyr::select(., c(Slyc_polgerm1,Slyc_polgerm2,Slyc_polgerm3,Slyc_polungerm1,Slyc_polungerm2,Slyc_polungerm3)))) %>%
+  add_column(Pen_pollen_counts = rowMeans(dplyr::select(., c(Spen_polgerm1,Spen_polgerm2,Spen_polgerm3,Spen_polungerm1,Spen_polungerm2,Spen_polungerm3)))) %>%
+  add_column(Lyc_style_counts = rowMeans(dplyr::select(., c(Slyc_styungerm1,Slyc_styungerm2,Spen_styungerm3)))) %>%
+  add_column(Pen_style_counts = rowMeans(dplyr::select(., c(Spen_styungerm1,Spen_styungerm2,Spen_styungerm3)))) %>%
+  add_column(Lyc_leaf_counts = rowMeans(dplyr::select(., c(Slyc_leafP3r1,Slyc_leafP3r2,Slyc_leafP3r3,Slyc_leafP4d1,Slyc_leafP4d2,Slyc_leafP4d3,Slyc_leafP4p1,Slyc_leafP4p2,Slyc_leafP4p3,Slyc_leafP5d1,Slyc_leafP5d2,Slyc_leafP5d3,Slyc_leafP5p1,Slyc_leafP5p2,Slyc_leafP5p3,Slyc_leafP6d1,Slyc_leafP6d2,Slyc_leafP6p3)))) %>%
+  add_column(Pen_leaf_counts = rowMeans(dplyr::select(., c(Spen_leafP3r1,Spen_leafP3r2,Spen_leafP3r3,Spen_leafP4d1,Spen_leafP4d2,Spen_leafP4d3,Spen_leafP4p1,Spen_leafP4p2,Spen_leafP4p3,Spen_leafP5d1,Spen_leafP5d2,Spen_leafP5d3,Spen_leafP5p1,Spen_leafP5p2,Spen_leafP5p3,Spen_leafP6d1,Spen_leafP6d2,Spen_leafP6p3)))) %>%
+  select(c(Geneid,Lyc_pollen_counts,Pen_pollen_counts,Lyc_style_counts,Pen_style_counts,Lyc_leaf_counts,Pen_leaf_counts)) %>%
+  dplyr::left_join(results_df, by = c("Geneid" = "Gene")) %>%
+  arrange("Geneid")
+
+view(PMEIReadCountsWide)
+
+write.csv(PMEsWide, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/PMEsWide.csv")
+
+write.csv(PMEIsWide, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/PMEIsWide.csv")
+
+write.csv(PMEReadCountsWide, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/PMEReadCountsWide.csv")
+
+write.csv(PMEIReadCountsWide, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/PMEIReadCountsWide.csv")
+
+PMEsWideFull<- PMEsWide %>%
+  dplyr::left_join(PMEReadCountsWide, by = c("GeneID" = "Geneid"))
+
+view(PMEsWideFull)
+```
+
+#Reformatting other supplemental data
+```{r}
+SupplementalOneStyleExpressionOfPollenBiased <- read.csv(file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData1_StyleExpressionofPollenBiasedGenes.csv", header = TRUE, sep = ",", row.names = NULL)
+view(SupplementalOneStyleExpressionOfPollenBiased) 
+
+SupplementalOneReorganized <- SupplementalOneStyleExpressionOfPollenBiased %>%
+  dplyr::select(-c(PME,PMEI,TPMError,species, tissue,chromosome,log2Expression,Error, log10Expression,log10Error, log2Expression)) %>%
+  arrange(GeneID) %>%
+  pivot_wider(id_cols = GeneID, names_from = SpTis, values_from = c(TPM, tau, biased)) %>%
+  dplyr::mutate(tau_lycopersicum = tau_lyc_styungerm, tau_pennellii = tau_pen_styungerm) %>%
+  dplyr::select(-c(tau_lyc_styungerm, tau_pen_styungerm)) %>%
+  dplyr::mutate(bias_lycopersicum = biased_lyc_styungerm, bias_pennellii = biased_pen_styungerm) %>%
+  dplyr::select(-c(biased_lyc_styungerm, biased_pen_styungerm)) %>%
+  dplyr::relocate(GeneID, TPM_lyc_styungerm, TPM_pen_styungerm, tau_lycopersicum, tau_pennellii, bias_lycopersicum, bias_pennellii)
+
+view(SupplementalOneReorganized)
+
+view(masterDFNew)
+
+write.csv(SupplementalOneReorganized, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData1_StyleExpressionofPollenBiasedGenesV2.csv", row.names = FALSE)
+
+SupplementalData2 <- read.csv(file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData2_ReproductiveSpecificPMEsDeseq.csv", header = TRUE, sep = ",", row.names = NULL)
+view(SupplementalData2)
+
+SupplementalData2Reorganized <- masterDFNew %>%
+  dplyr::filter(GeneID %in% SupplementalData2$GeneID) %>%
+  dplyr::select(-c(PME,PMEI,TPMError,species, tissue,chromosome,log2Expression,Error, log10Expression,log10Error, log2Expression)) %>%
+  arrange(GeneID) %>%
+  pivot_wider(id_cols = GeneID, names_from = SpTis, values_from = c(TPM, tau, biased)) %>%
+  dplyr::mutate(tau_lycopersicum = tau_lyc_styungerm, tau_pennellii = tau_pen_leaf) %>%
+  dplyr::select(-c(tau_lyc_pollen, tau_lyc_leaf, tau_lyc_styungerm, tau_pen_styungerm, tau_pen_pollen, tau_pen_leaf)) %>%
+  dplyr::mutate(bias_lycopersicum = biased_lyc_styungerm, bias_pennellii = biased_pen_leaf) %>%
+  dplyr::select(-c(biased_lyc_pollen, biased_lyc_leaf, biased_lyc_styungerm, biased_pen_styungerm, biased_pen_pollen, biased_pen_leaf)) %>%
+  dplyr::relocate(GeneID,TPM_lyc_pollen, TPM_pen_pollen, TPM_lyc_styungerm, TPM_pen_styungerm, TPM_lyc_leaf, TPM_pen_leaf, tau_lycopersicum, tau_pennellii, bias_lycopersicum, bias_pennellii)
+
+view(SupplementalData2Reorganized)
+
+write.csv(SupplementalData2Reorganized, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData2_ReproductiveSpecificPMEsDeseqV2.csv", row.names = FALSE)
+
+SupplementalData2ReadCountsWide <- readCounts %>%
+  dplyr::filter(GeneID %in% SupplementalData2Reorganized$GeneID) %>%
+  add_column(Lyc_pollen_counts = rowMeans(dplyr::select(., c(Slyc_polgerm1,Slyc_polgerm2,Slyc_polgerm3,Slyc_polungerm1,Slyc_polungerm2,Slyc_polungerm3)))) %>%
+  add_column(Pen_pollen_counts = rowMeans(dplyr::select(., c(Spen_polgerm1,Spen_polgerm2,Spen_polgerm3,Spen_polungerm1,Spen_polungerm2,Spen_polungerm3)))) %>%
+  add_column(Lyc_style_counts = rowMeans(dplyr::select(., c(Slyc_styungerm1,Slyc_styungerm2,Spen_styungerm3)))) %>%
+  add_column(Pen_style_counts = rowMeans(dplyr::select(., c(Spen_styungerm1,Spen_styungerm2,Spen_styungerm3)))) %>%
+  add_column(Lyc_leaf_counts = rowMeans(dplyr::select(., c(Slyc_leafP3r1,Slyc_leafP3r2,Slyc_leafP3r3,Slyc_leafP4d1,Slyc_leafP4d2,Slyc_leafP4d3,Slyc_leafP4p1,Slyc_leafP4p2,Slyc_leafP4p3,Slyc_leafP5d1,Slyc_leafP5d2,Slyc_leafP5d3,Slyc_leafP5p1,Slyc_leafP5p2,Slyc_leafP5p3,Slyc_leafP6d1,Slyc_leafP6d2,Slyc_leafP6p3)))) %>%
+  add_column(Pen_leaf_counts = rowMeans(dplyr::select(., c(Spen_leafP3r1,Spen_leafP3r2,Spen_leafP3r3,Spen_leafP4d1,Spen_leafP4d2,Spen_leafP4d3,Spen_leafP4p1,Spen_leafP4p2,Spen_leafP4p3,Spen_leafP5d1,Spen_leafP5d2,Spen_leafP5d3,Spen_leafP5p1,Spen_leafP5p2,Spen_leafP5p3,Spen_leafP6d1,Spen_leafP6d2,Spen_leafP6p3)))) %>%
+  select(c(GeneID,Lyc_pollen_counts,Pen_pollen_counts,Lyc_style_counts,Pen_style_counts,Lyc_leaf_counts,Pen_leaf_counts)) %>%
+  dplyr::left_join(results_df, by = c("GeneID" = "Gene")) %>%
+  arrange("GeneID")
+
+view(SupplementalData2ReadCountsWide)
+
+write.csv(SupplementalData2ReadCountsWide, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData2_ReproductiveSpecificPMEsReadCountsWide.csv")
+
+SupplementalData3 <- read.csv(file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData3_ReproductiveSpecificPMEIsDeseq.csv", header = TRUE, sep = ",", row.names = NULL)
+view(SupplementalData3)
+
+SupplementalData3Reorganized <- masterDFNew %>%
+  dplyr::filter(GeneID %in% SupplementalData3$GeneID) %>%
+  dplyr::select(-c(PME,PMEI,TPMError,species, tissue,chromosome,log2Expression,Error, log10Expression,log10Error, log2Expression)) %>%
+  arrange(GeneID) %>%
+  pivot_wider(id_cols = GeneID, names_from = SpTis, values_from = c(TPM, tau, biased)) %>%
+  dplyr::mutate(tau_lycopersicum = tau_lyc_styungerm, tau_pennellii = tau_pen_leaf) %>%
+  dplyr::select(-c(tau_lyc_pollen, tau_lyc_leaf, tau_lyc_styungerm, tau_pen_styungerm, tau_pen_pollen, tau_pen_leaf)) %>%
+  dplyr::mutate(bias_lycopersicum = biased_lyc_styungerm, bias_pennellii = biased_pen_leaf) %>%
+  dplyr::select(-c(biased_lyc_pollen, biased_lyc_leaf, biased_lyc_styungerm, biased_pen_styungerm, biased_pen_pollen, biased_pen_leaf)) %>%
+  dplyr::relocate(GeneID,TPM_lyc_pollen, TPM_pen_pollen, TPM_lyc_styungerm, TPM_pen_styungerm, TPM_lyc_leaf, TPM_pen_leaf, tau_lycopersicum, tau_pennellii, bias_lycopersicum, bias_pennellii)
+
+view(SupplementalData3Reorganized)
+
+write.csv(SupplementalData3Reorganized, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData3_ReproductiveSpecificPMEIsDeseqV2.csv")
+
+SupplementalData3ReadCountsWide <- readCounts %>%
+  dplyr::filter(Geneid %in% SupplementalData3Reorganized$GeneID) %>%
+  add_column(Lyc_pollen_counts = rowMeans(dplyr::select(., c(Slyc_polgerm1,Slyc_polgerm2,Slyc_polgerm3,Slyc_polungerm1,Slyc_polungerm2,Slyc_polungerm3)))) %>%
+  add_column(Pen_pollen_counts = rowMeans(dplyr::select(., c(Spen_polgerm1,Spen_polgerm2,Spen_polgerm3,Spen_polungerm1,Spen_polungerm2,Spen_polungerm3)))) %>%
+  add_column(Lyc_style_counts = rowMeans(dplyr::select(., c(Slyc_styungerm1,Slyc_styungerm2,Spen_styungerm3)))) %>%
+  add_column(Pen_style_counts = rowMeans(dplyr::select(., c(Spen_styungerm1,Spen_styungerm2,Spen_styungerm3)))) %>%
+  add_column(Lyc_leaf_counts = rowMeans(dplyr::select(., c(Slyc_leafP3r1,Slyc_leafP3r2,Slyc_leafP3r3,Slyc_leafP4d1,Slyc_leafP4d2,Slyc_leafP4d3,Slyc_leafP4p1,Slyc_leafP4p2,Slyc_leafP4p3,Slyc_leafP5d1,Slyc_leafP5d2,Slyc_leafP5d3,Slyc_leafP5p1,Slyc_leafP5p2,Slyc_leafP5p3,Slyc_leafP6d1,Slyc_leafP6d2,Slyc_leafP6p3)))) %>%
+  add_column(Pen_leaf_counts = rowMeans(dplyr::select(., c(Spen_leafP3r1,Spen_leafP3r2,Spen_leafP3r3,Spen_leafP4d1,Spen_leafP4d2,Spen_leafP4d3,Spen_leafP4p1,Spen_leafP4p2,Spen_leafP4p3,Spen_leafP5d1,Spen_leafP5d2,Spen_leafP5d3,Spen_leafP5p1,Spen_leafP5p2,Spen_leafP5p3,Spen_leafP6d1,Spen_leafP6d2,Spen_leafP6p3)))) %>%
+  select(c(Geneid,Lyc_pollen_counts,Pen_pollen_counts,Lyc_style_counts,Pen_style_counts,Lyc_leaf_counts,Pen_leaf_counts)) %>%
+  dplyr::left_join(results_df, by = c("Geneid" = "Gene")) %>%
+  arrange("Geneid")
+
+view(SupplementalData3ReadCountsWide)
+
+write.csv(SupplementalData3ReadCountsWide, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData3_ReproductiveSpecificPMEIsReadCountsWide.csv")
+
+SupplementalData12 <- read.csv(file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData12_PollenBiasedGenes.csv", header = TRUE, sep = ",", row.names = NULL)
+
+view(SupplementalData12)
+
+SupplementalData12Reorganized <- masterDFNew %>%
+  dplyr::filter(GeneID %in% SupplementalData12$GeneID) %>%
+  dplyr::select(-c(PME,PMEI,TPMError,species, tissue,chromosome,log2Expression,Error, log10Expression,log10Error, log2Expression)) %>%
+  arrange(GeneID) %>%
+  pivot_wider(id_cols = GeneID, names_from = SpTis, values_from = c(TPM, tau, biased)) %>%
+  dplyr::mutate(tau_lycopersicum = tau_lyc_styungerm, tau_pennellii = tau_pen_leaf) %>%
+  dplyr::select(-c(tau_lyc_pollen, tau_lyc_leaf, tau_lyc_styungerm, tau_pen_styungerm, tau_pen_pollen, tau_pen_leaf)) %>%
+  #dplyr::mutate(bias_lycopersicum = biased_lyc_styungerm, bias_pennellii = biased_pen_leaf) %>% #This line is commented out because it is redundant, all genes in this dataset are pollen biased
+  dplyr::select(-c(biased_lyc_pollen, biased_lyc_leaf, biased_lyc_styungerm, biased_pen_styungerm, biased_pen_pollen, biased_pen_leaf)) %>%
+  dplyr::relocate(GeneID,TPM_lyc_pollen, TPM_pen_pollen, TPM_lyc_styungerm, TPM_pen_styungerm, TPM_lyc_leaf, TPM_pen_leaf, tau_lycopersicum, tau_pennellii)
+
+view(SupplementalData12Reorganized)
+
+write.csv(SupplementalData12Reorganized, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData12_PollenBiasedGenesV2.csv", row.names = FALSE)
+```
+
+```{r}
+#filtering for style expressed genes, to tell if there is a difference between species due to the lower amount of style expressed pollen biased genes in S. lycopersicum
+styleExpressedGenes <- masterDFNew %>%
+  dplyr::filter(tissue == "styungerm") %>%
+  dplyr::filter(TPM > 2)
+
+#need to count the number of genes in each species
+styleExpressedGenes %>%
+  dplyr::filter(species == "lyc") %>%
+  nrow()
+
+styleExpressedGenes %>%
+  dplyr::filter(species == "pen") %>%
+  nrow()
+
+masterDFNew <- masterDFNew %>%
+  mutate(PMEPMEI = ifelse(PME == TRUE | PMEI == TRUE, ifelse(PME == TRUE, "PME", "PMEI"), "other"))
+
+
+masterDF %>%
+  filter(PMEPMEI != "other")  %>%
+  filter(GeneID %in% notInLeaf$GeneID)  %>%
+  filter(tissue != 'leaf') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 1) +
+  geom_line(aes(colour=PMEPMEI,group=GeneIDTis), size = 0.3) +
+  #theme() +
+  scale_x_discrete(labels=c("pen_pollen" = "S. pennellii pollen",
+                            "lyc_pollen" = "S. lycopersicum pollen", 
+                            "pen_styungerm" = "S. pennellii style", 
+                            "lyc_styungerm" = "S. lycopersicum style")) +
+  scale_y_continuous(limits = c(0, NA)) + 
+  labs(#title = 'Reproductive Tissue PMEs & PMEIs',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)',
+       color = "Gene Family") + 
+  theme_classic() +
+  theme(axis.text = element_text(size = 8), 
+        axis.title = element_text(size = 8),
+        #title = element_text(size = 12),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = c(0.8, 0.8))+
+  scale_color_manual(values = c("#311432","#ff6700"))
+
+styleExpressedGenes %>%
+  filter(biased == "pollen") %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 1) +
+  geom_line(aes(colour=biased,group=GeneID), size = 0.3)
+
+styleExpressedGenes %>%
+  filter(biased == "styungerm") %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 1) +
+  geom_line(aes(colour=biased,group=GeneID), size = 0.3)
+
+styleExpressedGenes %>%
+  filter(biased == "leaf") %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 1) +
+  geom_line(aes(colour=biased,group=GeneID), size = 0.3)
+
+styleExpressedGenes %>%
+  filter(biased == "unbiased") %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 1) +
+  geom_line(aes(colour=biased,group=GeneID), size = 0.3)
+
+
+# Load the necessary library
+library(dplyr)
+
+# Find GeneIDs that have expression in one species but not the other
+expressed_in_one_species <- styleExpressedGenes %>%
+  group_by(GeneID) %>%
+  filter(n_distinct(species) == 1) %>%
+  pull(GeneID)
+
+# Add this information as a new column to the styleExpressedGenes data frame
+styleExpressedGenes <- styleExpressedGenes %>%
+  mutate(ExpressedInOneSpecies = ifelse(GeneID %in% expressed_in_one_species, "Yes", "No"))
+
+# View the modified data frame
+View(styleExpressedGenes)
+
+styleExpressedGenes %>%
+  filter(ExpressedInOneSpecies == "Yes") %>%
+  filter(biased == "pollen") %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 1) +
+  geom_line(aes(colour=biased,group=GeneID), size = 0.3)
+
+styleExpressedGenes %>%
+  filter(ExpressedInOneSpecies == "Yes") %>%
+  filter(biased == "styungerm") %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 1) +
+  geom_line(aes(colour=biased,group=GeneID), size = 0.3)
+
+styleExpressedGenes %>%
+  filter(ExpressedInOneSpecies == "Yes") %>%
+  filter(biased == "leaf") %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 1) +
+  geom_line(aes(colour=biased,group=GeneID), size = 0.3)
+
+styleExpressedGenes %>%
+  filter(ExpressedInOneSpecies == "Yes") %>%
+  filter(biased == "unbiased") %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point(size = 1) +
+  geom_line(aes(colour=biased,group=GeneID), size = 0.3)
+
+```
+#trying to see if there is a pattern of pollen compenstation for style gene expression changes in pollen biased genes
+```{r}
+#will need this
+#pivot_wider(id_cols = GeneID, names_from = SpTis, values_from = c(TPM, tau, biased)) %>%
+significantPollenBiased <- masterDFNew %>%
+  filter(GeneID %in% pollenBiased$GeneID) %>%
+  filter(pollen_species_padj <= 0.05) %>%
+  filter(style_species_padj <= 0.05) %>% 
+  pivot_wider(id_cols = GeneID, names_from = SpTis, values_from = c(TPM, tau, biased)) %>%
+  filter(TPM_lyc_styungerm + TPM_pen_styungerm > 2) #%>%
+  #filter(TPM_lyc_pollen + TPM_pen_pollen > 1000)
+
+significantPollenBiased <- significantPollenBiased %>%
+  mutate(
+    Change_StyUngerm = sign(TPM_lyc_styungerm - TPM_pen_styungerm),
+    Change_Pollen = sign(TPM_pen_pollen - TPM_lyc_pollen )
+  )
+
+significantPollenBiased <- significantPollenBiased %>%
+  mutate(
+    Same_Opposite = ifelse(Change_StyUngerm == Change_Pollen, "Higher expression in lyc pollen and pen style", "Not")
+  )
+
+# Count the number of times the signs are the same
+same_sign <- sum(significantPollenBiased$Change_StyUngerm == significantPollenBiased$Change_Pollen)
+
+# Count the total number of comparisons
+total <- nrow(significantPollenBiased)
+
+# Perform the binomial test
+result <- binom.test(same_sign, total)
+result
+
+moddedForTest <- masterDFNew %>%
+  filter(GeneID %in% significantPollenBiased$GeneID) %>%
+  left_join(significantPollenBiased)
+  
+
+moddedForTest %>%
+  filter(GeneID %in% significantPollenBiased$GeneID) %>%
+  filter(tissue != 'leaf') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point() +
+  geom_line(aes(colour=Same_Opposite,group=GeneIDTis )) + 
+  scale_x_discrete(labels=c("pen_pollen" = "Sp. pollen",
+                            "lyc_pollen" = "Sl. pollen", 
+                            "pen_styungerm" = "Sp. style", 
+                            "lyc_styungerm" = "Sl. style")) +
+  theme_classic() +
+  theme(legend.position = c(0.8, 0.9)) +
+  labs(title = 'Significant Pollen Biased Genes',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)')
+
+
+significantPollenBiased <- masterDFNew %>%
+  filter(GeneID %in% pollenBiased$GeneID) %>%
+  filter(pollen_species_padj <= 0.05) %>%
+  filter(style_species_padj <= 0.05) %>% 
+  pivot_wider(id_cols = GeneID, names_from = SpTis, values_from = c(TPM, tau, biased)) %>%
+  filter(TPM_lyc_styungerm + TPM_pen_styungerm > 2) %>%
+  filter(TPM_lyc_pollen + TPM_pen_pollen > 2000)
+
+significantPollenBiased <- significantPollenBiased %>%
+  mutate(
+    Change_StyUngerm = sign(TPM_lyc_styungerm - TPM_pen_styungerm),
+    Change_Pollen = sign(TPM_pen_pollen - TPM_lyc_pollen )
+  )
+
+significantPollenBiased <- significantPollenBiased %>%
+  mutate(
+    Same_Opposite = ifelse(Change_StyUngerm == Change_Pollen, "Higher expression in lyc pollen and pen style", "Not")
+  )
+
+# Count the number of times the signs are the same
+same_sign <- sum(significantPollenBiased$Change_StyUngerm == significantPollenBiased$Change_Pollen)
+
+# Count the total number of comparisons
+total <- nrow(significantPollenBiased)
+
+# Perform the binomial test
+result <- binom.test(same_sign, total)
+result
+
+moddedForTest <- masterDFNew %>%
+  filter(GeneID %in% significantPollenBiased$GeneID) %>%
+  left_join(significantPollenBiased)
+  
+
+moddedForTest %>%
+  filter(GeneID %in% significantPollenBiased$GeneID) %>%
+  filter(tissue != 'leaf') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point() +
+  geom_line(aes(colour=Same_Opposite,group=GeneIDTis )) + 
+  scale_x_discrete(labels=c("pen_pollen" = "Sp. pollen",
+                            "lyc_pollen" = "Sl. pollen", 
+                            "pen_styungerm" = "Sp. style", 
+                            "lyc_styungerm" = "Sl. style")) +
+  theme_classic() +
+  theme(legend.position = c(0.8, 0.9)) +
+  labs(title = 'Significant Pollen Biased Genes',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)')
+
+significantPollenBiased <- masterDFNew %>%
+  filter(GeneID %in% pollenBiased$GeneID) %>%
+  #filter(pollen_species_padj <= 0.05) %>%
+  #filter(style_species_padj <= 0.05) %>% 
+  pivot_wider(id_cols = GeneID, names_from = SpTis, values_from = c(TPM, tau, biased)) #%>%
+  #filter(TPM_lyc_styungerm + TPM_pen_styungerm > 2) %>%
+  #filter(TPM_lyc_pollen + TPM_pen_pollen > 1000)
+
+significantPollenBiased <- significantPollenBiased %>%
+  mutate(
+    Change_StyUngerm = sign(TPM_lyc_styungerm - TPM_pen_styungerm),
+    Change_Pollen = sign(TPM_pen_pollen - TPM_lyc_pollen )
+  )
+
+significantPollenBiased <- significantPollenBiased %>%
+  mutate(
+    Same_Opposite = ifelse(Change_StyUngerm == Change_Pollen, "Higher expression in lyc pollen and pen style", "Not")
+  )
+
+# Count the number of times the signs are the same
+same_sign <- sum(significantPollenBiased$Change_StyUngerm == significantPollenBiased$Change_Pollen)
+
+# Count the total number of comparisons
+total <- nrow(significantPollenBiased)
+
+# Perform the binomial test
+result <- binom.test(same_sign, total)
+result
+
+moddedForTest <- masterDFNew %>%
+  filter(GeneID %in% significantPollenBiased$GeneID) %>%
+  left_join(significantPollenBiased)
+  
+
+moddedForTest %>%
+  filter(GeneID %in% significantPollenBiased$GeneID) %>%
+  filter(tissue != 'leaf') %>%
+  unite('GeneIDTis',c(GeneID,tissue),remove = F) %>%
+  ggplot(aes(x=factor(SpTis, levels = c('pen_pollen','lyc_pollen','pen_styungerm','lyc_styungerm')),
+             y=log10Expression,
+             ymax=log10Expression+log10Error,
+             ymin=log10Expression-log10Error)) +
+  geom_errorbar(width=0.1) +
+  geom_point() +
+  geom_line(aes(colour=Same_Opposite,group=GeneIDTis )) + 
+  scale_x_discrete(labels=c("pen_pollen" = "Sp. pollen",
+                            "lyc_pollen" = "Sl. pollen", 
+                            "pen_styungerm" = "Sp. style", 
+                            "lyc_styungerm" = "Sl. style")) +
+  theme_classic() +
+  theme(legend.position = c(0.8, 0.9)) +
+  labs(title = 'Significant Pollen Biased Genes',
+       x='Species & Tissue',
+       y='Gene Expression (log base 10 TPM)')
+```
+
+#Section for aligning in-vivo pollen donors and in-vitro pollen donors
+```{r}
+inVitroForJoining <-pollenMDFLycoPenn %>%
+  mutate(
+    AccessionNum = str_replace_all(AccessionNum, "716", "LA0716")
+  ) %>%
+  unite("SpPollenDonor",c(AccessionNum,IndividualNum), remove = F, sep = "_") %>%
+  select(c(AccessionNum,IndividualNum, SpPollenDonor, PollenTubeRateMean)) %>% 
+  dplyr::rename(AvgPollenTubeLengthPerHour = PollenTubeRateMean) %>%
+  dplyr::rename(Species = AccessionNum) %>%
+  #dplyr::rename(PollenDonor = IndividualNum) %>%
+  mutate(Test = "in-vitro")
+
+JoinedInVitroInVivo <- InVivoPollenTubeGrowthMeansTime %>%
+  filter(LowPollen ==F) %>%
+  dplyr::group_by(SpPollenDonor, SpPollenRecipient, Species, LowPollen) %>%
+  summarise(AvgPollenTubeLengthPerHour = mean(pollenTubeLengthMeansPerHour, na.rm = TRUE)) %>%
+  ungroup() %>%
+  select(c(Species, SpPollenDonor, AvgPollenTubeLengthPerHour)) %>%
+  mutate(
+    Test = "in-vivo",
+    #PollenDonor = as.character(PollenDonor)
+  ) %>%
+  bind_rows(inVitroForJoining)
+
+
+JoinedInVitroInVivo %>%
+  unite("SpPollenDonorTest",c(SpPollenDonor,Test), remove = F, sep = "_") %>%
+  unite("SpTest",c(Species,Test), remove = F, sep = "_") %>%
+  ggplot(aes(y = AvgPollenTubeLengthPerHour, x = SpPollenDonor)) +
+  #stat_summary(aes(y = pollenTubeLengthMeansPerHour, x = SpPollenDonorTest),fun = mean, geom = "crossbar", width = 0.5, color = "black", , position = position_nudge(x=-1)) +
+  #stat_summary(aes(y = pollenTubeLengthMeansPerHour, x = SpTest),
+  #             fun = mean, geom = "crossbar",width = 12, color = "blue", size = 0.3, position = position_nudge(x=-10)) +
+  geom_point(aes(color=SpTest), size = 1) +
+  labs(x = "Species and Individuals", y = "Pollen Tube Growth Rate (ums/hour)", color = "Species & Test") +
+  theme_classic() +
+  theme(legend.position = c(0.9, 0.9), 
+        #axis.text.x=element_blank(),
+        #axis.ticks.x=element_blank(), 
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        panel.spacing = unit(0.1, "cm")) #+
+  #scale_color_manual(labels = c("S. pennellii", "S. lycopersicum"), values = c("#000075","#ff6700")) +
+  #scale_shape_manual(values = c(17,16))
+```
+
+
+###Things to remake after redoing deseq2 results
+#Need to remake top 10 differentially expressed genes list
+#Check which PMEs and PMEIs are significantly differentially expressed
+#check how many style expressed pollen biased genes are differentially expressed in style tissue
+```{r}
+#Starting with the top 10 differentially expressed genes
+mDFWStats <- masterDFNew %>%
+  left_join(results_dfUnited, by = "GeneID")
+
+styleBiasedFix <- mDFWStats %>%
+  filter(biased == "styungerm")
+
+pollenBiasedFix <- mDFWStats %>%
+  filter(biased == "pollen")
+
+lycStyleBiasedFix <- mDFWStats %>%
+  filter(species == "lyc") %>%
+  filter(GeneID %in% styleBiasedFix$GeneID) %>%
+  filter(tissue =="styungerm") %>%
+  dplyr::arrange(GeneID)
+
+penStyleBiasedFix <- mDFWStats %>%
+  filter(species == "pen") %>%
+  filter(GeneID %in% styleBiasedFix$GeneID) %>%
+  filter(tissue =="styungerm") %>%
+  dplyr::arrange(GeneID)
+
+lycPollenBiasedFix <- mDFWStats %>%
+  filter(species == "lyc") %>%
+  filter(GeneID %in% pollenBiasedFix$GeneID) %>%
+  filter(tissue == "pollen") %>%
+  dplyr::arrange(GeneID)
+
+penPollenBiasedFix <- mDFWStats %>%
+  filter(species == "pen") %>%
+  filter(GeneID %in% pollenBiasedFix$GeneID) %>%
+  filter(tissue == "pollen") %>%
+  dplyr::arrange(GeneID)
+
+penPollenDifferenceFix <- penPollenBiasedFix %>%
+  inner_join(lycPollenBiasedFix, by = "GeneID", suffix = c("_pen", "_lyc")) %>%
+  # Create a new column for the difference in TPM between pen and lyc
+  mutate(TPM_difference = TPM_pen - TPM_lyc)
+
+topPolDifferencesFix <- penPollenDifferenceFix %>%
+  mutate(absDifference = abs(TPM_difference)) %>%
+  dplyr::filter(P_pollen.species_pen < 0.05)
+  
+topPolDifferencesFixSelect <- topPolDifferencesFix %>%
+  select(c(GeneID,absDifference, TPM_difference, LFC_pollen.species_pen))
+
+StyleDifferenceFix <-penStyleBiasedFix %>%
+  inner_join(lycStyleBiasedFix, by = "GeneID", suffix = c("_pen", "_lyc")) %>%
+  # Create a new column for the difference in TPM between pen and lyc
+  mutate(TPM_difference = TPM_pen - TPM_lyc)
+
+topStyDifferencesFix <- StyleDifferenceFix %>%
+  mutate(absDifference = abs(TPM_difference)) %>%
+  dplyr::filter(P_style.species_pen < 0.05)
+  
+topStyDifferencesFixSelect <- topStyDifferencesFix %>%
+  select(c(GeneID,absDifference, TPM_difference, LFC_style.species_pen))
+
+styleSpecificFix <- mDFWStats %>%
+  filter(biased == "styungerm") %>%
+  filter(tau == 1)
+
+pollenSpecificFix <- mDFWStats %>%
+  filter(biased == "pollen") %>%
+  filter(tau  == 1)
+
+lycStyleSpecificFix <- mDFWStats %>%
+  filter(species == "lyc") %>%
+  filter(GeneID %in% styleSpecificFix$GeneID) %>%
+  filter(tissue =="styungerm") %>%
+  filter() %>%
+  dplyr::arrange(GeneID)
+
+penStyleSpecificFix <- mDFWStats %>%
+  filter(species == "pen") %>%
+  filter(GeneID %in% styleSpecificFix$GeneID) %>%
+  filter(tissue =="styungerm") %>%
+  dplyr::arrange(GeneID)
+
+lycPollenSpecificFix <- mDFWStats %>%
+  filter(species == "lyc") %>%
+  filter(GeneID %in% pollenSpecificFix$GeneID) %>%
+  filter(tissue == "pollen") %>%
+  dplyr::arrange(GeneID)
+
+penPollenSpecificFix <- mDFWStats %>%
+  filter(species == "pen") %>%
+  filter(GeneID %in% pollenSpecificFix$GeneID) %>%
+  filter(tissue == "pollen") %>%
+  dplyr::arrange(GeneID)
+
+
+penPollenSpecificDifferenceFix <- penPollenSpecificFix %>%
+  inner_join(lycPollenSpecificFix, by = "GeneID", suffix = c("_pen", "_lyc")) %>%
+  # Create a new column for the difference in TPM between pen and lyc
+  mutate(TPM_difference = TPM_pen - TPM_lyc)
+
+topPolSpecificDifferencesFix <- penPollenSpecificDifferenceFix %>%
+  mutate(absDifference = abs(TPM_difference)) %>%
+  dplyr::filter(P_pollen.species_pen < 0.05)
+  
+topPolSpecificDifferencesFixSelect <- topPolSpecificDifferencesFix %>%
+  select(c(GeneID,absDifference, TPM_difference, LFC_pollen.species_pen))
+
+StyleSpecificDifferenceFix <-penStyleSpecificFix %>%
+  inner_join(lycStyleSpecificFix, by = "GeneID", suffix = c("_pen", "_lyc")) %>%
+  # Create a new column for the difference in TPM between pen and lyc
+  mutate(TPM_difference = TPM_pen - TPM_lyc)
+
+topStySpecificDifferencesFix <- StyleSpecificDifferenceFix %>%
+  mutate(absDifference = abs(TPM_difference)) %>%
+  dplyr::filter(P_style.species_pen < 0.05)
+  
+topStySpecificDifferencesFixSelect <- topStySpecificDifferencesFix %>%
+  select(c(GeneID,absDifference, TPM_difference, LFC_style.species_pen))
+
+#Now looking at PMEs
+repSpecificPMEs <-mDFWStats %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(PME == TRUE)
+
+PMEStyleExpDif <- StyleDifferenceFix %>%
+  filter(GeneID %in% repSpecificPMEs$GeneID)
+
+penPollenDifferenceFix %>%
+  filter(GeneID %in% repSpecificPMEs$GeneID)
+
+repSpecificPMEIs <-mDFWStats %>%
+  filter(GeneID %in% notInLeaf$GeneID) %>%
+  filter(PMEI == TRUE)
+
+readCounts <- readCounts %>%
+  dplyr::rename(GeneID = Geneid)
+
+results_Counts <- results_dfUnited %>%
+  left_join(readCounts, by = "GeneID")
+
+write.csv(results_dfUnited, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData1V2_DeSeqHypTests.csv", row.names = FALSE)
+
+results_PMEs <- results_Counts %>%
+  filter(GeneID %in% repSpecificPMEs$GeneID)
+
+results_PMEIs <- results_Counts %>%
+  filter(GeneID %in% repSpecificPMEIs$GeneID)
+
+readCountsAverage <- readCounts %>%
+  add_column(Lyc_pollen_counts = rowMeans(dplyr::select(., c(Slyc_polgerm1,Slyc_polgerm2,Slyc_polgerm3,Slyc_polungerm1,Slyc_polungerm2,Slyc_polungerm3)))) %>%
+  add_column(Pen_pollen_counts = rowMeans(dplyr::select(., c(Spen_polgerm1,Spen_polgerm2,Spen_polgerm3,Spen_polungerm1,Spen_polungerm2,Spen_polungerm3)))) %>%
+  add_column(Lyc_style_counts = rowMeans(dplyr::select(., c(Slyc_styungerm1,Slyc_styungerm2,Spen_styungerm3)))) %>%
+  add_column(Pen_style_counts = rowMeans(dplyr::select(., c(Spen_styungerm1,Spen_styungerm2,Spen_styungerm3)))) %>%
+  add_column(Lyc_leaf_counts = rowMeans(dplyr::select(., c(Slyc_leafP3r1,Slyc_leafP3r2,Slyc_leafP3r3,Slyc_leafP4d1,Slyc_leafP4d2,Slyc_leafP4d3,Slyc_leafP4p1,Slyc_leafP4p2,Slyc_leafP4p3,Slyc_leafP5d1,Slyc_leafP5d2,Slyc_leafP5d3,Slyc_leafP5p1,Slyc_leafP5p2,Slyc_leafP5p3,Slyc_leafP6d1,Slyc_leafP6d2,Slyc_leafP6p3)))) %>%
+  add_column(Pen_leaf_counts = rowMeans(dplyr::select(., c(Spen_leafP3r1,Spen_leafP3r2,Spen_leafP3r3,Spen_leafP4d1,Spen_leafP4d2,Spen_leafP4d3,Spen_leafP4p1,Spen_leafP4p2,Spen_leafP4p3,Spen_leafP5d1,Spen_leafP5d2,Spen_leafP5d3,Spen_leafP5p1,Spen_leafP5p2,Spen_leafP5p3,Spen_leafP6d1,Spen_leafP6d2,Spen_leafP6p3)))) %>%
+  select(c(GeneID,Lyc_pollen_counts,Pen_pollen_counts,Lyc_style_counts,Pen_style_counts,Lyc_leaf_counts,Pen_leaf_counts))
+
+results_AvgCounts <-results_dfUnited %>%
+  left_join(readCountsAverage, by = "GeneID")
+
+PMEsFull<-masterDFNew %>%
+  filter(PME == TRUE)
+
+PMEIsFull<-masterDFNew %>%
+  filter(PMEI == TRUE)
+
+PMEsResultsCounts<- results_AvgCounts %>%
+  filter(GeneID %in% PMEsFull$GeneID) %>%
+  arrange(GeneID)
+
+write.csv(PMEsResultsCounts, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData4bV2_PMEReadCounts.csv", row.names = FALSE)
+
+PMEIsResultsCounts<- results_AvgCounts %>%
+  filter(GeneID %in% PMEIsFull$GeneID) %>%
+  arrange(GeneID)
+
+write.csv(PMEIsResultsCounts, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData5bV2_PMEIReadCounts.csv", row.names = FALSE)
+
+pollenBiasedGenes <- masterDFNew %>%
+  filter(biased == "pollen") %>%
+  filter(tissue == "pollen") %>%
+  filter(TPM >= 2)
+
+pollenBiasedTPM <-masterDFNew %>%
+  filter(GeneID %in% pollenBiasedGenes$GeneID) %>%
+  select(c(GeneID, tissue, species, TPM)) %>%
+  dplyr::arrange(GeneID) %>%
+  pivot_wider(names_from = c(tissue, species),
+              values_from = c(TPM)) %>%
+  dplyr::relocate(GeneID,pollen_lyc, pollen_pen, styungerm_lyc, styungerm_pen, leaf_lyc, leaf_pen)
+
+tauWide<-masterDFNew %>%
+  select(GeneID,species, tau) %>%
+  distinct()%>%
+  pivot_wider(names_from = species,
+              values_from = tau)
+
+pollenBiasedTPMTau<-pollenBiasedTPM %>%
+  left_join(tauWide, by = "GeneID") %>%
+  dplyr::arrange(GeneID)
+
+write.csv(pollenBiasedTPMTau, file = "/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/SupplementalData/SupplementalData15V2_PollenBiased.csv", row.names = FALSE)
+```
+
+
+#Double checking stats
+```{r}
+#19667 lyc expressed
+masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(species == "lyc") %>%
+  select(GeneID) %>%
+  distinct()
+
+#6143 pol expressed
+masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(species == "lyc") %>%
+  filter(tissue == "pollen") %>%
+  select(GeneID) %>%
+  distinct()
+
+#16200 style expressed
+masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(species == "lyc") %>%
+  filter(tissue == "styungerm") %>%
+  select(GeneID) %>%
+  distinct()
+
+#19589 pen expressed genes
+masterDFNew %>%
+  filter(TPM > 2) %>%
+  filter(species == "pen") %>%
+  select(GeneID) %>%
+  distinct()
+```

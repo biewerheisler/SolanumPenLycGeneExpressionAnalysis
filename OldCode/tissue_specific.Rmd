@@ -1,0 +1,399 @@
+---
+title: "TPM cutoff method"
+author: "Matt Gibson & Tim BH"
+date: "4/11/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data")
+#install.packages("matrixStats")
+library(matrixStats)
+library(tidyverse)
+library(DT)
+library(dplyr)
+```
+
+### Functions
+```{r}
+counts_to_tpm <- function(counts, geneLength) {
+  
+  # Ensure valid arguments.
+  stopifnot(length(geneLength) == nrow(counts))
+  
+  # Process one column at a time.
+  tpm <- do.call(cbind, lapply(1:ncol(counts), function(i) {
+    rate = log(counts[,i]) - log(geneLength[i])
+    denom = log(sum(exp(rate)))
+    exp(rate - denom + log(1e6))
+  }))
+  
+  # Copy the row and column names from the original matrix.
+  colnames(tpm) <- colnames(counts)
+  rownames(tpm) <- rownames(counts)  
+  tpm <- data.frame(tpm)
+  return(tpm)
+}
+
+classify_expressed <- function(row, names, cutoff){
+  #Checks if gene is expressed greater than [cutoff] in at least 1 of the tissues included in  names.
+  #Returns boolean
+  
+  row <- row[which(names(row) %in% names)]
+  for(i in seq(1, length(names))){
+    if (as.numeric(row[i]) > cutoff){
+      return(TRUE)
+    }
+  }
+  return(FALSE)
+}
+
+classify_trace <- function(row, names, cutoff){
+  #Checks if gene is expressed less than [cutoff] in ALL of the tissues included in names.
+  #Returns boolean
+  
+  num_trace <-  0
+  
+  row <- row[which(names(row) %in% names)]
+  for(i in seq(1, length(names))){
+    if (as.numeric(row[i]) < cutoff){
+      num_trace <- num_trace + 1
+    }
+  }
+  if  (num_trace == length(names)){
+    return(TRUE)
+  }else{return(FALSE)}
+  
+}
+#std_mean <- function(x) sd(x)/sqrt(length(x)) #calculates standard error of the mean
+
+
+```
+
+
+## Data and preprocessing
+
+### Load data
+```{r}
+dfNew <- read.csv("/Users/tbiewerh/Desktop/PMEDifferentialGeneExpExp/data/pen_lyc_readcounts.txt", sep = "\t")
+```
+
+### Convert to TPM
+```{r}
+df_tpm <- counts_to_tpm(dfNew[,c(7:ncol(dfNew))], dfNew$Length)
+df_tpm$GeneID <- str_remove(dfNew$Geneid, "gene:")
+```
+
+### Calculate averages
+```{r}
+slyc_polgerm <- rowMeans(df_tpm[,c(1,2,3)])
+slyc_polgermStErr <- rowSds(as.matrix(df_tpm[,c(1,2,3)]))
+slyc_polungerm <- rowMeans(df_tpm[,c(4,5,6)])
+slyc_polungermStErr <- rowSds(as.matrix(df_tpm[,c(4,5,6)]))
+slyc_pollenStErr <- rowSds(as.matrix(df_tpm[,c(1:6)]))
+slyc_styungerm <- rowMeans(df_tpm[,c(10,11,12)])
+slyc_styungermStErr <- rowSds(as.matrix(df_tpm[,c(10,11,12)]))
+slyc_leafP3P4 <- rowMeans(df_tpm[,c(25:33)])
+slyc_leafP3P4StErr <- rowSds(as.matrix(df_tpm[,c(25:33)]))
+slyc_leafP5P6 <- rowMeans(df_tpm[,c(34:45)])
+slyc_leafP5P6StErr <- rowSds(as.matrix(df_tpm[,c(34:45)]))
+slyc_leafStErr <- rowSds(as.matrix(df_tpm[,c(25:45)]))
+
+
+
+spen_polgerm <- rowMeans(df_tpm[,c(13,14,15)])
+spen_polgermStErr <- rowSds(as.matrix(df_tpm[,c(13,14,15)]))
+spen_polungerm <- rowMeans(df_tpm[,c(16,17,24)])
+spen_polungermStErr <- rowSds(as.matrix(df_tpm[,c(16,17,24)]))
+spen_pollenStErr <- rowSds(as.matrix(df_tpm[,c(13,14,15,16,17,24)]))
+spen_styungerm <- rowMeans(df_tpm[,c(21,22,23)])
+spen_styungermStErr <- rowSds(as.matrix(df_tpm[,c(21,22,23)]))
+spen_leafP3P4 <- rowMeans(df_tpm[,c(46:54)])
+spen_leafP3P4StErr <- rowSds(as.matrix(df_tpm[,c(46:54)]))
+spen_leafP5P6 <- rowMeans(df_tpm[,c(55:66)])
+spen_leafP5P6StErr <- rowSds(as.matrix(df_tpm[,c(55:66)]))
+spen_leafStErr <- rowSds(as.matrix(df_tpm[,c(46:66)]))
+
+
+df_tpm <- data.frame(GeneID = df_tpm$GeneID,
+                     slyc_polgerm = slyc_polgerm,
+                     slyc_polungerm = slyc_polungerm,
+                     slyc_styungerm = slyc_styungerm,
+                     slyc_leafP3P4 = slyc_leafP3P4,
+                     slyc_leafP5P6 = slyc_leafP5P6,
+                     spen_polgerm = spen_polgerm,
+                     spen_polungerm = spen_polungerm,
+                     spen_styungerm = spen_styungerm,
+                     spen_leafP3P4 = spen_leafP3P4,
+                     spen_leafP5P6 = spen_leafP5P6)
+df_tpmWStErr <- data.frame(GeneID=df_tpm$GeneID,
+                           slyc_polgerm=slyc_polgerm,
+                           slyc_polgermStErr=slyc_polgermStErr,
+                           slyc_polungerm=slyc_polungerm,
+                           slyc_polungermStErr=slyc_polungermStErr,
+                           slyc_styungerm=slyc_styungerm,
+                           slyc_styungermStErr=slyc_styungermStErr,
+                           slyc_leafP3P4=slyc_leafP3P4,
+                           slyc_leafP3P4StErr=slyc_leafP3P4StErr,
+                           slyc_leafP5P6=slyc_leafP5P6,
+                           slyc_leafP5P6StErr=slyc_leafP5P6StErr,
+                           slyc_pollenStErr=slyc_pollenStErr,
+                           slyc_leafStErr=slyc_leafStErr,
+                           spen_polgerm=spen_polgerm,
+                           spen_polgermStErr=spen_polgermStErr,
+                           spen_polungerm=spen_polungerm,
+                           spen_polungermStErr=spen_polungermStErr,
+                           spen_styungerm=spen_styungerm,
+                           spen_styungermStErr=spen_styungermStErr,
+                           spen_leafP3P4=spen_leafP3P4,
+                           spen_leafP3P4StErr=spen_leafP3P4StErr,
+                           spen_leafP5P6=spen_leafP5P6,
+                           spen_leafP5P6StErr=spen_leafP5P6StErr,
+                           spen_pollenStErr=spen_pollenStErr,
+                           spen_leafStErr=spen_leafStErr) 
+df_tpm <- df_tpm %>% filter(!str_detect(GeneID, "Solyc00"))
+write.csv(df_tpm, "~/Desktop/PMEDifferentialGeneExpExp/data/LycPenTPM.csv")
+df_tpmWStErr <- df_tpmWStErr %>% filter(!str_detect(GeneID,"Solyc00"))
+write.csv(df_tpmWStErr,"~/Desktop/PMEDifferentialGeneExpExp/data/LycPenTPMWithStErr.csv")
+```
+#### Converting to log2 expression for simpler visualization
+```{r}
+#replace everything <1 TPM with NA
+df_tpm_NA <- replace(df_tpm, df_tpm < 1, NA)
+view(df_tpm_NA)
+#log transform (just the data without transcript IDs)
+df_tpm_NA_log <- log2(df_tpm_NA[,c(2:68)])
+
+#replace NAs with 0
+df_tpm_log <- replace(df_tpm_NA_log, is.na(df_tpm_NA_log), 0)
+df_tpm_log$GeneID <-df_tpm$GeneID
+
+slyc_polgerm <- rowMeans(df_tpm_log[,c(1,2,3)])
+slyc_polgermStErr <- rowSds(as.matrix(df_tpm_log[,c(1,2,3)]))
+slyc_polungerm <- rowMeans(df_tpm_log[,c(4,5,6)])
+slyc_polungermStErr <- rowSds(as.matrix(df_tpm_log[,c(4,5,6)]))
+
+slyc_styungerm <- rowMeans(df_tpm_log[,c(10,11,12)])
+slyc_styungermStErr <- rowSds(as.matrix(df_tpm_log[,c(10,11,12)]))
+slyc_leafP3P4 <- rowMeans(df_tpm_log[,c(25:33)])
+slyc_leafP3P4StErr <- rowSds(as.matrix(df_tpm_log[,c(25:33)]))
+slyc_leafP5P6 <- rowMeans(df_tpm_log[,c(34:45)])
+slyc_leafP5P6StErr <- rowSds(as.matrix(df_tpm_log[,c(34:45)]))
+slyc_pollen <- rowMeans(df_tpm_log[,c(1:6)])
+slyc_pollenStErr <- rowSds(as.matrix(df_tpm_log[,c(1:6)]))
+slyc_leaf <- rowMeans(df_tpm_log[,c(25:45)])
+slyc_leafStErr <- rowSds(as.matrix(df_tpm_log[,c(25:45)]))
+
+spen_polgerm <- rowMeans(df_tpm_log[,c(13,14,15)])
+spen_polgermStErr <- rowSds(as.matrix(df_tpm_log[,c(13,14,15)]))
+spen_polungerm <- rowMeans(df_tpm_log[,c(16,17,24)])
+spen_polungermStErr <- rowSds(as.matrix(df_tpm_log[,c(16,17,24)]))
+
+spen_styungerm <- rowMeans(df_tpm_log[,c(21,22,23)])
+spen_styungermStErr <- rowSds(as.matrix(df_tpm_log[,c(21,22,23)]))
+spen_leafP3P4 <- rowMeans(df_tpm_log[,c(46:54)])
+spen_leafP3P4StErr <- rowSds(as.matrix(df_tpm_log[,c(46:54)]))
+spen_leafP5P6 <- rowMeans(df_tpm_log[,c(55:66)])
+spen_leafP5P6StErr <- rowSds(as.matrix(df_tpm_log[,c(55:66)]))
+spen_pollen <- rowMeans(df_tpm_log[,c(13,14,15,16,17,24)])
+spen_pollenStErr <- rowSds(as.matrix(df_tpm_log[,c(13,14,15,16,17,24)]))
+spen_leaf <- rowMeans(df_tpm_log[,c(46:66)])
+spen_leafStErr <- rowSds(as.matrix(df_tpm_log[,c(46:66)]))
+
+df_tpm_logWStErr <- data.frame(GeneID=df_tpm$GeneID,
+                           slyc_polgerm=slyc_polgerm,
+                           slyc_polgermStErr=slyc_polgermStErr,
+                           slyc_polungerm=slyc_polungerm,
+                           slyc_polungermStErr=slyc_polungermStErr,
+                           slyc_styungerm=slyc_styungerm,
+                           slyc_styungermStErr=slyc_styungermStErr,
+                           slyc_leafP3P4=slyc_leafP3P4,
+                           slyc_leafP3P4StErr=slyc_leafP3P4StErr,
+                           slyc_leafP5P6=slyc_leafP5P6,
+                           slyc_leafP5P6StErr=slyc_leafP5P6StErr,
+                           slyc_pollen=slyc_pollen,
+                           slyc_pollenStErr=slyc_pollenStErr,
+                           slyc_leaf=slyc_leaf,
+                           slyc_leafStErr=slyc_leafStErr,
+                           spen_polgerm=spen_polgerm,
+                           spen_polgermStErr=spen_polgermStErr,
+                           spen_polungerm=spen_polungerm,
+                           spen_polungermStErr=spen_polungermStErr,
+                           spen_styungerm=spen_styungerm,
+                           spen_styungermStErr=spen_styungermStErr,
+                           spen_leafP3P4=spen_leafP3P4,
+                           spen_leafP3P4StErr=spen_leafP3P4StErr,
+                           spen_leafP5P6=spen_leafP5P6,
+                           spen_leafP5P6StErr=spen_leafP5P6StErr,
+                           spen_pollen=spen_pollen,
+                           spen_pollenStErr=spen_pollenStErr,
+                           spen_leaf=spen_leaf,
+                           spen_leafStErr=spen_leafStErr) 
+
+df_tpm_logWStErr <- df_tpm_logWStErr %>% filter(!str_detect(GeneID,"Solyc00"))
+write.csv(df_tpm_logWStErr,"~/Desktop/PMEDifferentialGeneExpExp/data/LycPenTPMLog2WithStErr.csv")
+df_tpm_logWStErrLoaded <- read.csv("~/Desktop/PMEDifferentialGeneExpExp/data/LycPenTPMLog2WithStErr.csv")
+view(df_tpm_logWStErr)
+df_tpm_logWStErr <- df_tpm_logWStErrLoaded %>%
+  dplyr::select(-X)
+```
+## Tissue specificity
+```{r}
+upperCutoff <- 2
+lowerCutoff <- 1
+```
+
+### LYC
+#### LYC Pollen
+```{r}
+lyc_pol <- df_tpm %>% mutate(LycPolExpressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_polungerm", "slyc_polgerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c( "slyc_styungerm", "slyc_leafP3P4", "slyc_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("LycPolExpressed", "Trace"))
+lyc_pol <- lyc_pol$LycPolExpressed & lyc_pol$Trace
+table(lyc_pol)
+datatable(df_tpm[lyc_pol,])
+```
+#### LYC Pollen Ungerm
+```{r}
+lyc_pol_ungerm <- df_tpm %>% mutate(LycPolExpressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_polungerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("slyc_polgerm", "slyc_styungerm", "slyc_leafP3P4", "slyc_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("LycPolExpressed", "Trace"))
+
+lyc_pol_ungerm <- lyc_pol_ungerm$LycPolExpressed & lyc_pol_ungerm$Trace
+table(lyc_pol_ungerm)
+datatable(df_tpm[lyc_pol_ungerm,])
+```
+
+#### LYC Pollen Germ
+```{r}
+lyc_pol_germ <- df_tpm %>% mutate(LycPolExpressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_polgerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("slyc_polungerm", "slyc_styungerm", "slyc_leafP3P4", "slyc_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("LycPolExpressed", "Trace"))
+
+lyc_pol_germ <- lyc_pol_germ$LycPolExpressed & lyc_pol_germ$Trace
+table(lyc_pol_germ)
+datatable(df_tpm[lyc_pol_germ,])
+```
+
+#### LYC Style
+```{r}
+lyc_sty <- df_tpm %>% mutate(LycStyExpressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_styungerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("slyc_polungerm", "slyc_polgerm", "slyc_leafP3P4", "slyc_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("LycStyExpressed", "Trace"))
+
+lyc_sty <- lyc_sty$LycStyExpressed & lyc_sty$Trace
+table(lyc_sty)
+datatable(df_tpm[lyc_sty,])
+```
+
+#### LYC Leaf P3P4
+```{r}
+lyc_p3p4 <- df_tpm %>% mutate(Lycp3p4Expressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_leafP3P4"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("slyc_polungerm", "slyc_polgerm", "slyc_styungerm", "slyc_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("Lycp3p4Expressed", "Trace"))
+
+lyc_p3p4 <- lyc_p3p4$Lycp3p4Expressed & lyc_p3p4$Trace
+table(lyc_p3p4)
+datatable(df_tpm[lyc_p3p4,])
+```
+
+#### LYC Leaf P5P6
+```{r}
+lyc_p5p6 <- df_tpm %>% mutate(lycp5p6Expressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_leafP5P6"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("slyc_polungerm", "slyc_polgerm", "slyc_styungerm", "slyc_leafP3P4"), lowerCutoff)) %>% dplyr::select(c("lycp5p6Expressed", "Trace"))
+
+lyc_p5p6 <- lyc_p5p6$lycp5p6Expressed & lyc_p5p6$Trace
+table(lyc_p5p6)
+datatable(df_tpm[lyc_p5p6,])
+```
+#### LYC Leaf
+```{r}
+lyc_leaf <- df_tpm %>% mutate(LycLeafExpressed = apply(df_tpm, 1, classify_expressed, names = c("slyc_leafP3P4","slyc_leafP5P6"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("slyc_polungerm", "slyc_polgerm", "slyc_styungerm"), lowerCutoff)) %>% dplyr::select(c("LycLeafExpressed", "Trace"))
+
+lyc_leaf <- lyc_leaf$LycLeafExpressed & lyc_leaf$Trace
+table(lyc_leaf)
+datatable(df_tpm[lyc_leaf,])
+
+```
+
+### PEN
+#### PEN Pollen
+```{r}
+pen_pol <- df_tpm %>% mutate(PenPolExpressed = apply(df_tpm, 1, classify_expressed, names = c("spen_polungerm", "spen_polgerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c( "spen_styungerm", "spen_leafP3P4", "spen_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("PenPolExpressed", "Trace"))
+pen_pol <- pen_pol$PenPolExpressed & pen_pol$Trace
+table(pen_pol)
+datatable(df_tpm[pen_pol,])
+```
+#### PEN Pollen Ungerm
+```{r}
+pen_pol_ungerm <- df_tpm %>% mutate(PenPolExpressed = apply(df_tpm, 1, classify_expressed, names = c("spen_polungerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("spen_polgerm", "spen_styungerm", "spen_leafP3P4", "spen_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("PenPolExpressed", "Trace"))
+
+pen_pol_ungerm <- pen_pol_ungerm$PenPolExpressed & pen_pol_ungerm$Trace
+table(pen_pol_ungerm)
+datatable(df_tpm[pen_pol_ungerm,])
+```
+
+#### PEN Pollen Germ
+```{r}
+pen_pol_germ <- df_tpm %>% mutate(PenPolExpressed = apply(df_tpm, 1, classify_expressed, names = c("spen_polgerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("spen_polungerm", "spen_styungerm", "spen_leafP3P4", "spen_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("PenPolExpressed", "Trace"))
+
+pen_pol_germ <- pen_pol_germ$PenPolExpressed & pen_pol_germ$Trace
+table(pen_pol_germ)
+datatable(df_tpm[pen_pol_germ,])
+```
+
+#### PEN Style
+```{r}
+pen_sty <- df_tpm %>% mutate(PenStyExpressed = apply(df_tpm, 1, classify_expressed, names = c("spen_styungerm"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("spen_polungerm", "spen_polgerm", "spen_leafP3P4", "spen_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("PenStyExpressed", "Trace"))
+
+pen_sty <- pen_sty$PenStyExpressed & pen_sty$Trace
+table(pen_sty)
+datatable(df_tpm[pen_sty,])
+```
+
+#### PEN Leaf P3P4
+```{r}
+pen_p3p4 <- df_tpm %>% mutate(Penp3p4Expressed = apply(df_tpm, 1, classify_expressed, names = c("spen_leafP3P4"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("spen_polungerm", "spen_polgerm", "spen_styungerm", "spen_leafP5P6"), lowerCutoff)) %>% dplyr::select(c("Penp3p4Expressed", "Trace"))
+
+pen_p3p4 <- pen_p3p4$Penp3p4Expressed & pen_p3p4$Trace
+table(pen_p3p4)
+datatable(df_tpm[pen_p3p4,])
+```
+
+#### PEN Leaf P5P6
+```{r}
+pen_p5p6 <- df_tpm %>% mutate(penp5p6Expressed = apply(df_tpm, 1, classify_expressed, names = c("spen_leafP5P6"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("spen_polungerm", "spen_polgerm", "spen_styungerm", "spen_leafP3P4"), lowerCutoff)) %>% dplyr::select(c("penp5p6Expressed", "Trace"))
+
+pen_p5p6 <- pen_p5p6$penp5p6Expressed & pen_p5p6$Trace
+table(pen_p5p6)
+datatable(df_tpm[pen_p5p6,])
+
+```
+
+#### PEN Leaf
+```{r}
+pen_leaf <- df_tpm %>% mutate(PenLeafExpressed = apply(df_tpm, 1, classify_expressed, names = c("spen_leafP3P4","spen_leafP5P6"), upperCutoff),
+                  Trace = apply(df_tpm, 1, classify_trace, names = c("spen_polungerm", "spen_polgerm", "spen_styungerm"), lowerCutoff)) %>% dplyr::select(c("PenLeafExpressed", "Trace"))
+
+pen_leaf <- pen_leaf$PenLeafExpressed & pen_leaf$Trace
+table(pen_leaf)
+datatable(df_tpm[pen_leaf,])
+
+```
+
+### Aggregate datasets
+```{r}
+specificDataset <- data.frame("GeneID"=df_tpm[,1])
+specificDataset <- specificDataset %>%
+  add_column(lyc_pol_germ,lyc_pol_ungerm,lyc_pol,lyc_sty,lyc_p3p4,lyc_p5p6,lyc_leaf, pen_pol_germ,pen_pol_ungerm,pen_pol,pen_sty,pen_p3p4,pen_p5p6,pen_leaf ) 
+
+write.csv(specificDataset,"~/Desktop/PMEDifferentialGeneExpExp/data/specificDataset.csv")
+specificDatasetLoaded <- read.csv("~/Desktop/PMEDifferentialGeneExpExp/data/specificDataset.csv")
+view(specificDataset)
+specificDataset <- specificDatasetLoaded %>%
+  dplyr::select(-X)
+
+```
