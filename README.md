@@ -1,4 +1,5 @@
 # SolanumPenLycGeneExpressionAnalysis
+This repository contains the code and data used in the analysis of S. lycopersicum and S. pennellii pollen, style, and leaf gene expression, and pollen phenotypes in-vitro and in-vivo.
 
 The main code is all in PMERNAseqDeseq.Rmd. Old versions of the code, 
 with obsolete sections, exist across timRNAseq_deseq2.Rmd, timRNAseq_deseq2.Rmd, 
