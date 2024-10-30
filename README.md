@@ -7,6 +7,8 @@ and tissue_specific.Rmd.
 
 Scripts used by Matthew Gibson for preprocessing are in scripts.
 
+Figures are pdf files in the folder FiguresForSubmission
+
 Data files include:
 
 Supplement_BHetalTBD.xlsx = Supplemental tables referenced in the main text.
